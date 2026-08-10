@@ -1,0 +1,14 @@
+{
+  "name": "update-tools-marketplace",
+  "owner": {
+    "name": "Daniel Gutson",
+    "url": "https://github.com/dgutson"
+  },
+  "plugins": [
+    {
+      "name": "deps",
+      "source": "./",
+      "description": "AI-powered dependency review: profiles what your code actually consumes from each library, then judges whether each available update is worth taking."
+    }
+  ]
+}

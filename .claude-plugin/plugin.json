@@ -1,0 +1,23 @@
+{
+  "name": "deps",
+  "description": "An AI-powered dependabot that answers the question dependabot cannot: is this update worth taking? Builds a CLAUDE_DEPS.md profile of what your project actually consumes from each library — including C++ deps that Renovate ignores, like URL-pinned FetchContent archives and pkg-config system libraries — then intersects upstream release notes with your real API surface and ranks the updates. Can apply a bump, re-hash the archive, and verify the build.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Daniel Gutson"
+  },
+  "homepage": "https://github.com/dgutson/update-tools",
+  "repository": "https://github.com/dgutson/update-tools",
+  "license": "MIT",
+  "keywords": [
+    "dependencies",
+    "dependabot",
+    "renovate",
+    "upgrade",
+    "cmake",
+    "cpp",
+    "pkg-config",
+    "security",
+    "cve",
+    "changelog"
+  ]
+}
