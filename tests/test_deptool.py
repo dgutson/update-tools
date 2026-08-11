@@ -420,6 +420,143 @@ def test_graphify_backend_absent_is_not_an_error(tmp_path):
     assert _enrich_graphify(str(tmp_path), [Dep(name="x", kind="npm")]) is False
 
 
+def test_graphify_falls_back_to_references_for_macro_use(tmp_path):
+    """A macro-consumed symbol has no `calls` edges at all.
+
+    Hegel is used through `HEGEL_TEST(...)`, which graphify emits as a node per
+    test file with no outgoing call edge. A calls-only walk matches the seed
+    and then reports a blast radius of zero, which reads as "nothing uses
+    this" — the exact opposite of the truth.
+    """
+    import json
+
+    from deptool.backends import _enrich_graphify
+
+    graph = {
+        "nodes": [
+            {"id": "t1", "label": "HEGEL_TEST", "source_file": "test_a.cpp"},
+            {"id": "suite", "label": ".suite()", "source_file": "test_a.cpp"},
+            {"id": "main", "label": ".main()", "source_file": "test_a.cpp"},
+        ],
+        "links": [
+            # No `calls` edge anywhere near the macro.
+            {"source": "suite", "target": "t1", "relation": "references"},
+            {"source": "main", "target": "suite", "relation": "calls"},
+        ],
+    }
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    (out / "graph.json").write_text(json.dumps(graph))
+
+    dep = Dep(name="hegel", kind="cmake-fetchcontent-url", consumed=["HEGEL_TEST"])
+    assert _enrich_graphify(str(tmp_path), [dep]) is True
+    # suite references it; main reaches it transitively through suite.
+    assert dep.blast_radius == 2
+    # Nothing *called* it, so claiming a call depth would be a fabrication.
+    assert dep.call_depth is None
+    assert any("no call edges" in n for n in dep.notes)
+
+
+def test_graphify_prefers_call_edges_over_references(tmp_path):
+    """The fallback must not widen the radius when real call edges exist."""
+    import json
+
+    from deptool.backends import _enrich_graphify
+
+    graph = {
+        "nodes": [
+            {"id": "ext", "label": "fluid_synth_noteon", "source_file": ""},
+            {"id": "caller", "label": ".noteOn()", "source_file": "a.cpp"},
+            {"id": "mentioner", "label": ".docs()", "source_file": "b.cpp"},
+        ],
+        "links": [
+            {"source": "caller", "target": "ext", "relation": "calls"},
+            {"source": "mentioner", "target": "ext", "relation": "references"},
+        ],
+    }
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    (out / "graph.json").write_text(json.dumps(graph))
+
+    dep = Dep(name="fluidsynth", kind="pkg-config", consumed=["fluid_synth_noteon"])
+    assert _enrich_graphify(str(tmp_path), [dep]) is True
+    assert dep.blast_radius == 1  # not 2 — `.docs()` only mentions it
+    assert dep.call_depth == 1
+
+
+# ------------------------------------------------------------ backend merging
+
+
+def test_backends_are_additive_not_first_wins(monkeypatch, tmp_path):
+    """Two backends covering different deps must both land.
+
+    graphify resolves the C ABI but is blind to namespaced C++; codebase-memory
+    claims the opposite. An earlier version `break`ed after the first backend
+    that returned anything, so graphify's partial result suppressed the other
+    entirely.
+    """
+    from deptool import backends
+
+    c_dep = Dep(name="fluidsynth", kind="pkg-config")
+    cpp_dep = Dep(name="libremidi", kind="cmake-fetchcontent-url")
+
+    def fake_graphify(root, deps):
+        backends._record(deps[0], "graphify", 8, "graphify: 8")
+        return True
+
+    def fake_cbmem(root, deps):
+        backends._record(deps[1], "codebase-memory", 3, "codebase-memory: 3")
+        return True
+
+    monkeypatch.setattr(backends, "detect", lambda root: ["graphify", "codebase-memory", "builtin"])
+    monkeypatch.setattr(backends, "_ENRICHERS",
+                        {"graphify": fake_graphify, "codebase-memory": fake_cbmem})
+
+    used = backends.analyse(str(tmp_path), [c_dep, cpp_dep])
+
+    assert used == "graphify+codebase-memory+builtin"
+    assert c_dep.blast_radius == 8
+    assert cpp_dep.blast_radius == 3  # would be None under first-wins
+
+
+def test_force_backend_runs_only_that_one(monkeypatch, tmp_path):
+    from deptool import backends
+
+    dep = Dep(name="fluidsynth", kind="pkg-config")
+    ran = []
+
+    def make(name, radius):
+        def fake(root, deps):
+            ran.append(name)
+            backends._record(deps[0], name, radius, f"{name}: {radius}")
+            return True
+        return fake
+
+    monkeypatch.setattr(backends, "detect", lambda root: ["graphify", "codebase-memory", "builtin"])
+    monkeypatch.setattr(backends, "_ENRICHERS",
+                        {"graphify": make("graphify", 8),
+                         "codebase-memory": make("codebase-memory", 3)})
+
+    used = backends.analyse(str(tmp_path), [dep], force="codebase-memory")
+
+    assert ran == ["codebase-memory"]
+    assert used == "codebase-memory+builtin"
+
+
+def test_record_keeps_largest_radius_and_both_notes():
+    """Overlap between backends is unknown, so summing would double-count."""
+    from deptool.backends import _record
+
+    dep = Dep(name="fluidsynth", kind="pkg-config")
+    _record(dep, "graphify", 8, "graphify: 8 callers", depth=1)
+    _record(dep, "codebase-memory", 3, "codebase-memory: 3 callers")
+
+    assert dep.blast_radius == 8  # a lower bound, not 11
+    assert dep.backend == "graphify+codebase-memory+builtin"
+    assert len(dep.notes) == 2
+    assert dep.call_depth == 1  # the backend that had no depth must not erase it
+
+
 # ------------------------------------------------------------ profile round trip
 
 

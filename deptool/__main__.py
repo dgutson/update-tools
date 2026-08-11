@@ -36,7 +36,7 @@ def _emit(obj, as_json: bool, human) -> None:
 
 def _build_profile(root: str, prefer_backend: str = "") -> tuple[list[Dep], dict]:
     deps, manifests = discover.discover(root)
-    used = backends.analyse(root, deps, prefer=prefer_backend)
+    used = backends.analyse(root, deps, force=prefer_backend)
     meta = {
         "repo": os.path.basename(os.path.abspath(root)),
         "generated": date.today().isoformat(),
@@ -317,7 +317,8 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("profile", help="regenerate CLAUDE_DEPS.md", parents=[common])
-    sp.add_argument("--backend", default="", help="force an analysis backend")
+    sp.add_argument("--backend", default="", choices=["", *backends.NAMES],
+                    help="run only this analysis backend (default: all detected)")
     sp.add_argument("--force", action="store_true",
                     help="discard existing assessments instead of preserving them")
     sp.set_defaults(func=cmd_profile)
@@ -328,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("check", parents=[common], help="gather upgrade evidence")
     sp.add_argument("--pre", action="store_true", help="include pre-releases")
     sp.add_argument("--only", default="", help="comma-separated dependency names")
-    sp.add_argument("--backend", default="")
+    sp.add_argument("--backend", default="", choices=["", *backends.NAMES])
     sp.set_defaults(func=cmd_check)
 
     sp = sub.add_parser("plan", parents=[common], help="show the edit for a bump, without writing")

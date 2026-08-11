@@ -18,7 +18,11 @@ from speculation.
   and `target_link_libraries` edges — separates test-only from shipped.
 - npm, Cargo, PyPI, Go module manifests.
 - Consumed-symbol extraction with `file:line` sites (builtin backend).
-- Graphify backend: blast radius via reverse BFS over `calls` edges.
+- Graphify backend: blast radius via reverse BFS over `calls` edges, falling
+  back to `references` edges for symbols consumed through a macro (which
+  graphify emits with no call edges at all).
+- Additive backends: every detected backend runs and their findings merge, so
+  a backend that covers only part of the dependency set cannot mask another.
 - Upstream resolution: GitHub releases/tags, PyPI, npm, crates.io, Repology
   (for distro-shipped system libraries).
 - OSV.dev advisory lookup.
@@ -131,7 +135,9 @@ Honest list of what has **not** been run against reality:
 
 - **`codebase-memory` backend** — written against published docs, exercised
   only by unit-test fakes. The CLI shape (`cli trace_path --direction
-  inbound`) is documented, not verified.
+  inbound`) is documented, not verified. Consequently the additive merge has
+  never run with two *live* backends: only graphify has ever contributed to a
+  real profile, so the largest-wins rule in `_record` is untested in anger.
 - **Non-C++ extraction** — the npm/Cargo/PyPI/Go parsers have unit tests but
   have not been run against a substantial real project.
 - **Conan and vcpkg** — parsed, never exercised end-to-end.

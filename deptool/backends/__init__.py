@@ -1,9 +1,15 @@
 """Pluggable analysis backends.
 
-The built-in extractor always works. If a richer code-graph tool is present we
-use it instead, because it can answer things grep cannot — how deep a
+The built-in extractor always works. If richer code-graph tools are present we
+run them too, because they can answer things grep cannot — how deep a
 dependency sits below main(), whether a call is reachable from a real-time
 thread, which of our functions transitively depend on it.
+
+Every available backend runs; they are complementary, not ranked alternatives.
+Graphify resolves the C ABI but cannot see namespaced C++; codebase-memory
+claims LSP-grade type resolution. Stopping at the first backend that returned
+anything would let a partial result mask a dependency another could have
+covered.
 
 Detection is automatic and non-fatal: a missing backend is never an error.
 """
@@ -44,31 +50,56 @@ def describe(root: str) -> str:
     found = detect(root)
     rich = [b for b in found if b != "builtin"]
     if rich:
-        return f"{rich[0]} (+ builtin fallback)"
+        return f"{' + '.join(rich)} (+ builtin fallback)"
     return "builtin (no code-graph backend detected)"
 
 
-def analyse(root: str, deps: list[Dep], prefer: str = "") -> str:
-    """Fill dep.consumed / dep.sites. Returns the backend actually used."""
+def analyse(root: str, deps: list[Dep], force: str = "") -> str:
+    """Fill dep.consumed / dep.sites. Returns the backends that contributed.
+
+    `force` restricts the run to a single named backend — the escape hatch for
+    when one is wrong or slow. Without it every detected backend runs and
+    their findings merge (see `_record`).
+    """
     order = detect(root)
-    if prefer:
-        order = [prefer] + [b for b in order if b != prefer]
+    if force:
+        # Honour the name even if detection missed it — the enrichers each
+        # re-check their own availability and no-op when absent. `builtin` is
+        # not in _ENRICHERS, so forcing it is how you turn the rich pass off.
+        order = [force]
 
     # The builtin pass always runs: it is what produces the file:line sites
     # that make the profile auditable. Graph backends then enrich.
     builtin.analyse(root, deps)
-    used = "builtin"
+    contributed: list[str] = []
 
     for name in order:
-        if name == "graphify":
-            if _enrich_graphify(root, deps):
-                used = "graphify+builtin"
-                break
-        elif name == "codebase-memory":
-            if _enrich_codebase_memory(root, deps):
-                used = "codebase-memory+builtin"
-                break
-    return used
+        enrich = _ENRICHERS.get(name)
+        if enrich and enrich(root, deps) and name not in contributed:
+            contributed.append(name)
+    return "+".join(contributed + ["builtin"])
+
+
+def _record(dep: Dep, backend: str, radius: int, note: str,
+            depth: int | None = None) -> None:
+    """Merge one backend's finding into a dep without discarding another's.
+
+    Backends see overlapping slices of the same graph, and by an unknown
+    amount — graphify counts nodes, codebase-memory counts names, and nothing
+    reliably maps between them. Summing would double-count, so the largest
+    single-backend count is kept. That reads as a lower bound: *at least* this
+    much of our code reaches the dependency. Every backend still appends its
+    own note, so the evidence stays separable.
+    """
+    prior = [b for b in dep.backend.split("+") if b and b != "builtin"]
+    if backend not in prior:
+        prior.append(backend)
+    dep.backend = "+".join(prior + ["builtin"])
+    if dep.blast_radius is None or radius > dep.blast_radius:
+        dep.blast_radius = radius
+    if depth is not None and (dep.call_depth is None or depth < dep.call_depth):
+        dep.call_depth = depth
+    dep.notes.append(note)
 
 
 def _graphify_path(root: str) -> str | None:
@@ -88,6 +119,12 @@ def _enrich_graphify(root: str, deps: list[Dep]) -> bool:
     depth-from-entry-point is not available. What *is* available, and is more
     useful for judging an upgrade, is the reverse question: how much of our
     code transitively reaches this dependency.
+
+    Symbols consumed through a macro (`HEGEL_TEST(...)`) are nodes with no
+    `calls` edges at all, so a calls-only walk matches the seed and then
+    reports a blast radius of zero — the worst possible answer, since it reads
+    as "nothing uses this". Those deps fall back to `references` edges, which
+    is a weaker claim and is labelled as such in the note.
     """
     path = _graphify_path(root)
     if not path:
@@ -118,13 +155,19 @@ def _enrich_graphify(root: str, deps: list[Dep]) -> bool:
         if bare and bare != label:
             by_label.setdefault(bare, []).append(n["id"])
 
-    # Reverse adjacency over genuine call edges only.
+    # Two reverse adjacencies: genuine call edges, and the same plus the much
+    # looser `references` relation used only as a fallback.
     callers: dict[str, set[str]] = {}
+    loose: dict[str, set[str]] = {}
     for e in edges:
-        if e.get("relation") not in ("calls", "method"):
+        relation = e.get("relation")
+        if relation not in ("calls", "method", "references"):
             continue
         src, tgt = e.get("source"), e.get("target")
-        if src and tgt:
+        if not (src and tgt):
+            continue
+        loose.setdefault(tgt, set()).add(src)
+        if relation != "references":
             callers.setdefault(tgt, set()).add(src)
 
     touched = False
@@ -138,39 +181,59 @@ def _enrich_graphify(root: str, deps: list[Dep]) -> bool:
         if not seeds:
             continue
 
-        direct = set()
-        for s in seeds:
-            direct |= callers.get(s, set())
-
-        # Reverse BFS: everything of ours that transitively reaches the dep.
-        reached: set[str] = set()
-        frontier, hops = set(direct), 1
-        depth_of_first = 1 if direct else None
-        while frontier and hops < 64:
-            reached |= frontier
-            nxt: set[str] = set()
-            for nid in frontier:
-                nxt |= callers.get(nid, set()) - reached
-            frontier = nxt
-            hops += 1
+        direct, reached = _reverse_bfs(seeds, callers)
+        via_references = False
+        if not direct:
+            # Macro or header-only use: the seed exists but nothing "calls" it.
+            direct, reached = _reverse_bfs(seeds, loose)
+            via_references = bool(direct)
 
         our_reachers = {n for n in reached if n in by_id and n not in seeds}
         if not our_reachers and not direct:
             continue
 
-        dep.blast_radius = len(our_reachers)
-        dep.call_depth = depth_of_first
-        dep.backend = "graphify+builtin"
         names = sorted(
             str(by_id[n].get("label", "")).strip(".()") for n in list(direct)[:6] if n in by_id
         )
-        if names:
-            dep.notes.append(
-                f"graphify: {len(direct)} direct caller(s), {len(our_reachers)} "
-                f"function(s) transitively reach it — e.g. {', '.join(n for n in names if n)}"
+        example = ", ".join(n for n in names if n)
+        if via_references:
+            # No call edge was ever traversed, so claiming a call depth of 1
+            # would be a fabrication — leave it unset.
+            note = (
+                f"graphify: no call edges (macro or header-only use); "
+                f"{len(direct)} direct reference(s), {len(our_reachers)} "
+                f"function(s) transitively reach it"
             )
+            depth = None
+        else:
+            note = (
+                f"graphify: {len(direct)} direct caller(s), {len(our_reachers)} "
+                f"function(s) transitively reach it"
+            )
+            depth = 1
+        if example:
+            note += f" — e.g. {example}"
+        _record(dep, "graphify", len(our_reachers), note, depth)
         touched = True
     return touched
+
+
+def _reverse_bfs(seeds: set[str], callers: dict[str, set[str]]) -> tuple[set, set]:
+    """Everything that transitively reaches `seeds`. Returns (direct, reached)."""
+    direct: set[str] = set()
+    for s in seeds:
+        direct |= callers.get(s, set())
+
+    reached: set[str] = set()
+    frontier, hops = set(direct), 1
+    while frontier and hops < 64:
+        reached |= frontier
+        nxt: set[str] = set()
+        for nid in frontier:
+            nxt |= callers.get(nid, set()) - reached
+        frontier = nxt
+        hops += 1
+    return direct, reached
 
 
 def _codebase_memory_exe() -> str | None:
@@ -225,14 +288,25 @@ def _enrich_codebase_memory(root: str, deps: list[Dep]) -> bool:
                 continue
             callers |= _collect_names(data)
         if callers:
-            dep.blast_radius = len(callers)
-            dep.backend = "codebase-memory+builtin"
-            dep.notes.append(
+            _record(
+                dep, "codebase-memory", len(callers),
                 f"codebase-memory: {len(callers)} function(s) reach it — "
-                + ", ".join(sorted(callers)[:6])
+                + ", ".join(sorted(callers)[:6]),
             )
             touched = True
     return touched
+
+
+# Declared after the enrichers so the names resolve; `analyse` walks this in
+# whatever order `detect` returned.
+_ENRICHERS = {
+    "graphify": _enrich_graphify,
+    "codebase-memory": _enrich_codebase_memory,
+}
+
+# What `--backend` accepts. Since that flag now *restricts* the run rather than
+# merely reordering it, a typo would silently disable every rich backend.
+NAMES = sorted(_ENRICHERS) + ["builtin"]
 
 
 def _collect_names(data) -> set[str]:

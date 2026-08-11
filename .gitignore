@@ -5,3 +5,4 @@ __pycache__/
 .pytest_cache/
 *.deptool.bak
 .claude/settings.local.json*
+HANDOFF.md
