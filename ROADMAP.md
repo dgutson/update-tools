@@ -30,32 +30,42 @@ from speculation.
   `### Assessment` prose.
 - Bump application with archive re-hashing, declaration-scoped edits,
   build/test verification, and revert.
-- Coupled-pin detection **(observed)**.
+- Coupled-pin detection **and resolution** **(observed)** — reads the
+  dependency's own build files at the target tag to find what its companion
+  version must become, cross-checks the extraction against the currently pinned
+  version, and bumps both in one atomic edit. `apply` refuses when a companion
+  cannot be resolved.
 
 ---
 
 ## Near term
 
-### 1. Bump companion pins together **(observed — highest value)**
+### 1. Companion pins upstream declares nowhere **(observed)**
 
-Detection shipped; **resolution did not**. Today the tool warns and stops.
+Resolution now ships (see above) and works when upstream states the requirement
+in a build file at the tag, or names it in release-note prose. Verified against
+real repositories: `grpc/grpc` moves `gRPC_CORE_VERSION` from `37.0.0` to
+`44.1.0` between `v1.60.0` and `v1.68.0`, and that is resolved, cross-checked
+and applied as one edit.
 
-zeta-daw pins Hegel twice: the source tarball at `v0.7.4`, and
-`HEGEL_LIBHEGEL_VERSION 0.29.0` for its prebuilt native engine. Bumping the
-source alone configures cleanly and then fails at link time:
+What is still unsolved is the case that motivated the feature. zeta-daw's
+`HEGEL_LIBHEGEL_VERSION` corresponds to a **prebuilt binary release**, and if
+Hegel does not declare the pairing in a file we read, there is nothing to
+extract — resolution correctly reports `unresolved` rather than guessing, and
+`apply` correctly refuses, but the upgrade is still blocked. Ways in, roughly by
+expected value:
 
-```
-undefined reference to `hegel_settings_set_stateful_step_count'
-```
+- **Release assets.** A prebuilt engine ships as a named artefact
+  (`libhegel-0.31.0-linux-x86_64.tar.gz`); the GitHub release asset list for the
+  target tag often *is* the answer.
+- **Lockfiles and CI config** in the dependency's own repo — the version its own
+  CI installs is the version it was tested against.
+- **Try-and-see**, once verification runs in a sandbox (item 3): with several
+  candidate companion versions, "which pair builds?" is answerable mechanically.
 
-That failure looks like a compiler problem, not a dependency problem. The tool
-already surfaces the coupling — the CACHE docstring even says *"libhegel
-version required by Hegel C++ v0.7.4"* — but it cannot work out that 0.11.1
-needs libhegel 0.31.x. Next step: read the new release's own CMake/metadata for
-its required companion version and offer both edits as one atomic change.
-
-Generalises beyond Hegel: prebuilt binaries, ABI levels, protocol versions,
-and toolchain minimums are all coupled pins.
+Two smaller gaps in what shipped: only GitHub upstreams can be read (a
+`distro:`/`pypi:` dependency reports `unresolved` immediately), and a pin
+attached by proximity alone is flagged but never confirmed.
 
 ### 2. Trust the changelog less
 
@@ -141,6 +151,11 @@ Honest list of what has **not** been run against reality:
 - **Non-C++ extraction** — the npm/Cargo/PyPI/Go parsers have unit tests but
   have not been run against a substantial real project.
 - **Conan and vcpkg** — parsed, never exercised end-to-end.
+- **Companion resolution** has been run end-to-end against `grpc/grpc` and
+  `FluidSynth/fluidsynth`, covering the resolved, unchanged, diverged and
+  unresolved paths — but only for CMake `set()` pins on GitHub-hosted
+  dependencies. The release-notes fallback is unit-tested only; no real release
+  note has ever been the source of a companion version.
 
 ### 11. Should this also open PRs?
 

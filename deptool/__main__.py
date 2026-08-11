@@ -10,6 +10,10 @@ this output as input.
     python3 -m deptool plan      --dep NAME --to VERSION [--root R]
     python3 -m deptool apply     --dep NAME --to VERSION [--root R] [--verify]
     python3 -m deptool revert    --dep NAME --to VERSION [--root R]
+
+`plan` and `apply` also resolve coupled pins — a second version that must move
+with the dependency — and bump them in the same edit. `apply` refuses when one
+cannot be resolved; `--ignore-companions` overrides that.
 """
 
 from __future__ import annotations
@@ -21,9 +25,46 @@ import sys
 from datetime import date
 
 from . import apply as apply_mod
-from . import backends, discover, profile, upstream
+from . import backends, companion, discover, profile, upstream
 from .fingerprint import compare
 from .model import Dep
+
+
+_COMPANION_MARK = {"bump": "+>", "unchanged": "==", "unresolved": "!?"}
+
+
+def _companion_lines(companions: list[dict], indent: str = "  ") -> list[str]:
+    """Render coupled-pin resolutions. `!?` is the one that blocks an apply."""
+    out = []
+    for c in companions:
+        mark = _COMPANION_MARK.get(c.get("action", ""), "  ")
+        head = f"{indent}{mark} {c['var']} {c.get('current') or '?'}"
+        if c.get("action") == "bump":
+            head += f" -> {c['required']}"
+        elif c.get("action") == "unchanged":
+            head += " — unchanged at the target version"
+        elif c.get("required"):
+            head += f" -> {c['required']}? (not applied)"
+        else:
+            head += " -> unknown"
+        if c.get("confidence"):
+            head += f"  [{c['confidence']}]"
+        out.append(head)
+        if c.get("evidence"):
+            out.append(f"{indent}   {c['evidence']}")
+        for note in c.get("notes") or []:
+            out.append(f"{indent}   ! {note}")
+    return out
+
+
+def _resolve_companions(dep: Dep, target: str) -> list[dict]:
+    """Look up what each coupled pin must become at `target`."""
+    if not dep.companion_pins:
+        return []
+    versions = upstream.fetch_versions(dep)
+    return companion.resolve_all(
+        dep, target, versions, companion.notes_for(target, versions)
+    )
 
 
 def _emit(obj, as_json: bool, human) -> None:
@@ -164,6 +205,17 @@ def cmd_check(args) -> int:
     for dep in deps:
         info = upstream.summarise(dep, allow_prerelease=args.pre)
         vulns = upstream.advisories(dep)
+        # Only worth the network round trip when there is both a coupled pin
+        # and somewhere to move to.
+        companions = []
+        if dep.companion_pins and info.get("resolved") and info.get("behind_by"):
+            versions = list(info.get("available") or [])
+            if info.get("current_tag"):
+                versions.append({"version": info["current"], "tag": info["current_tag"]})
+            companions = companion.resolve_all(
+                dep, info["latest"], versions,
+                companion.notes_for(info["latest"], info.get("available")),
+            )
         findings.append({
             "name": dep.name,
             "kind": dep.kind,
@@ -178,6 +230,8 @@ def cmd_check(args) -> int:
             "call_depth": dep.call_depth,
             "notes": dep.notes,
             "scope_evidence": dep.scope_evidence,
+            "companion_pins": [p.render() for p in dep.companion_pins],
+            "companions": companions,
             "assessment": dep.assessment,
             "upstream": info,
             "advisories": vulns,
@@ -209,6 +263,8 @@ def cmd_check(args) -> int:
             if f["consumed"]:
                 print(f"   we call: {', '.join(f['consumed'][:8])}"
                       f"{' …' if len(f['consumed']) > 8 else ''}")
+            for line in _companion_lines(f.get("companions") or [], indent="   "):
+                print(line)
             for v in f["advisories"]:
                 mark = "!!" if v.get("version_verified") else "?~"
                 fixed = f" fixed={v['fixed']}" if v.get("fixed") else ""
@@ -230,39 +286,74 @@ def _find_dep(root: str, name: str) -> Dep:
     raise SystemExit(f"no dependency named {name!r} in this repository")
 
 
+def _strip_private(planned: dict) -> dict:
+    shown = {k: v for k, v in planned.items() if not k.startswith("_")}
+    shown["edits"] = [
+        {k: v for k, v in e.items() if not k.startswith("_")} for e in planned.get("edits", [])
+    ]
+    return shown
+
+
 def cmd_plan(args) -> int:
     dep = _find_dep(args.root, args.dep)
+    companions = [] if args.ignore_companions else _resolve_companions(dep, args.to)
     try:
-        planned = apply_mod.plan(args.root, dep, args.to)
+        planned = apply_mod.plan(args.root, dep, args.to, companions=companions)
     except apply_mod.ApplyError as exc:
         print(f"cannot plan: {exc}", file=sys.stderr)
         return 1
-    shown = {k: v for k, v in planned.items() if not k.startswith("_")}
 
     def human(r):
         print(f"{r['dep']}: {r['from']} -> {r['to']} in {r['file']}")
         if r["new_hash"]:
             print(f"new hash: {r['new_hash']}")
-        if r["companion_pins"]:
-            print("WARNING: coupled pin(s) this edit does NOT change —")
+        if r.get("companions"):
+            print("coupled pins:")
+            for line in _companion_lines(r["companions"]):
+                print(line)
+        elif r["companion_pins"]:
+            print("coupled pin(s) NOT resolved (--ignore-companions) —")
             for c in r["companion_pins"]:
                 print(f"  {c}")
-            print("  bumping the source alone may fail at link time.")
+        if r["blocked_on"]:
+            print("WARNING: apply would refuse — unresolved coupled pin(s): "
+                  + "; ".join(r["blocked_on"]))
+            print("  bumping the dependency alone may fail at link time.")
         print(r["diff"])
 
-    _emit(shown, args.json, human)
+    _emit(_strip_private(planned), args.json, human)
     return 0
 
 
 def cmd_apply(args) -> int:
     dep = _find_dep(args.root, args.dep)
+    companions = [] if args.ignore_companions else _resolve_companions(dep, args.to)
     try:
-        planned = apply_mod.plan(args.root, dep, args.to)
+        planned = apply_mod.plan(args.root, dep, args.to, companions=companions)
     except apply_mod.ApplyError as exc:
         print(f"cannot apply: {exc}", file=sys.stderr)
         return 1
+
+    # A coupled pin we could not resolve is the one case where doing half the
+    # job is worse than doing none: the build configures cleanly and fails at
+    # link time with a missing symbol, which reads like a compiler problem.
+    if planned["blocked_on"]:
+        print(
+            f"refusing to bump {dep.name}: unresolved coupled pin(s) — "
+            + "; ".join(planned["blocked_on"]),
+            file=sys.stderr,
+        )
+        for line in _companion_lines(planned["companions"], indent="  "):
+            print(line, file=sys.stderr)
+        print(
+            "  set them by hand, or re-run with --ignore-companions to bump only "
+            f"{dep.name}.",
+            file=sys.stderr,
+        )
+        return 2
+
     apply_mod.write(args.root, planned)
-    result = {k: v for k, v in planned.items() if not k.startswith("_")}
+    result = _strip_private(planned)
     result["applied"] = True
     if args.verify:
         result["verify"] = apply_mod.verify(args.root, args.build_dir)
@@ -274,7 +365,15 @@ def cmd_apply(args) -> int:
         print(f"applied {r['dep']} {r['from']} -> {r['to']} in {r['file']}")
         if r.get("new_hash"):
             print(f"  URL_HASH updated: {r['new_hash']}")
-        print(f"  backup: {r['file']}.deptool.bak  (deptool revert restores it)")
+        for c in r["companion_edits"]:
+            print(f"  coupled pin {c['var']}: {c['from']} -> {c['to']} "
+                  f"in {c['file']}:{c['line']}  [{c['confidence']}]")
+            if c.get("evidence"):
+                print(f"    {c['evidence']}")
+            for note in c.get("notes") or []:
+                print(f"    ! {note}")
+        for e in r["edits"]:
+            print(f"  backup: {e['file']}.deptool.bak  (deptool revert restores it)")
         for step in r.get("verify", []):
             if "skipped" in step:
                 print(f"  skipped: {step['cmd']} — {step['skipped']}")
@@ -289,10 +388,19 @@ def cmd_apply(args) -> int:
 
 def cmd_revert(args) -> int:
     dep = _find_dep(args.root, args.dep)
-    rel = dep.declared_in.split(":")[0]
-    ok = apply_mod.revert(args.root, {"file": rel})
-    print(f"{'restored' if ok else 'no backup found for'} {rel}")
-    return 0 if ok else 1
+    # An apply may have touched a second file, if the coupled pin lives
+    # elsewhere. Restore every file this dependency could have edited.
+    rels = [dep.declared_in.split(":")[0]]
+    for pin in dep.companion_pins:
+        if pin.file and pin.file not in rels:
+            rels.append(pin.file)
+    restored = [r for r in rels if apply_mod.revert(args.root, {"edits": [{"file": r}]})]
+    if not restored:
+        print("no backup found for " + ", ".join(rels))
+        return 1
+    for rel in restored:
+        print(f"restored {rel}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -332,9 +440,15 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--backend", default="", choices=["", *backends.NAMES])
     sp.set_defaults(func=cmd_check)
 
+    companion_help = (
+        "do not resolve or edit coupled pins, and do not refuse when one is "
+        "unresolved — bump this dependency only"
+    )
+
     sp = sub.add_parser("plan", parents=[common], help="show the edit for a bump, without writing")
     sp.add_argument("--dep", required=True)
     sp.add_argument("--to", required=True)
+    sp.add_argument("--ignore-companions", action="store_true", help=companion_help)
     sp.set_defaults(func=cmd_plan)
 
     sp = sub.add_parser("apply", parents=[common], help="write the bump (and optionally verify)")
@@ -342,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--to", required=True)
     sp.add_argument("--verify", action="store_true", help="configure, build and test after editing")
     sp.add_argument("--build-dir", default="build")
+    sp.add_argument("--ignore-companions", action="store_true", help=companion_help)
     sp.set_defaults(func=cmd_apply)
 
     sp = sub.add_parser("revert", parents=[common], help="restore the pre-apply backup")

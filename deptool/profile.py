@@ -17,7 +17,7 @@ import os
 import re
 from datetime import date
 
-from .model import Dep, Site, Upstream
+from .model import CompanionPin, Dep, Site, Upstream
 
 FILENAME = "CLAUDE_DEPS.md"
 
@@ -78,7 +78,7 @@ def render(deps: list[Dep], root: str, meta: dict) -> str:
         lines += _fmt_list("sites", [
             f"{s.path}:{s.line}" + (f" — {s.symbol}" if s.symbol else "") for s in dep.sites
         ])
-        lines += _fmt_list("companion-pins", dep.companion_pins)
+        lines += _fmt_list("companion-pins", [p.render() for p in dep.companion_pins])
         lines += _fmt_list("scope-evidence", dep.scope_evidence)
         lines += _fmt_list("notes", dep.notes)
         lines.append(
@@ -187,7 +187,9 @@ def _append(dep: Dep, key: str, item: str) -> None:
                 Site(path=m.group(1), line=int(m.group(2)), symbol=(m.group(3) or "").strip())
             )
     elif key == "companion-pins":
-        dep.companion_pins.append(item)
+        pin = CompanionPin.parse(item)
+        if pin:
+            dep.companion_pins.append(pin)
     elif key == "scope-evidence":
         dep.scope_evidence.append(item)
     elif key == "notes":

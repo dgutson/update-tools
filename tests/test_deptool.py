@@ -13,10 +13,19 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from deptool import cmake, profile
+from deptool import cmake, companion, profile
 from deptool.apply import _declaration_span, _swap_version
+from deptool.apply import plan as apply_plan
 from deptool.fingerprint import hash_declaration, hash_files, hash_text
-from deptool.model import Dep, Site, Upstream, bump_kind, most_restrictive, parse_version
+from deptool.model import (
+    CompanionPin,
+    Dep,
+    Site,
+    Upstream,
+    bump_kind,
+    most_restrictive,
+    parse_version,
+)
 
 
 # ------------------------------------------------------------------ versions
@@ -299,8 +308,11 @@ def test_companion_pin_is_detected(tmp_path):
     dep = next(d for d in deps if d.name == "hegel")
     assert len(dep.companion_pins) == 1
     pin = dep.companion_pins[0]
-    assert "HEGEL_LIBHEGEL_VERSION=0.29.0" in pin
-    assert "libhegel version required" in pin  # CACHE docstring, not FORCE
+    assert (pin.var, pin.value) == ("HEGEL_LIBHEGEL_VERSION", "0.29.0")
+    assert "libhegel version required" in pin.doc  # CACHE docstring, not FORCE
+    # The file:line is what makes an atomic two-part edit possible at all.
+    assert pin.file == "CMakeLists.txt" and pin.line > 0
+    assert pin.matched_by == "name"
     assert any("coupled pin" in n for n in dep.notes)
 
 
@@ -673,3 +685,347 @@ def test_declaration_hash_handles_missing_file(tmp_path):
 def test_hash_text_is_deterministic():
     assert hash_text("x") == hash_text("x")
     assert hash_text("x") != hash_text("y")
+
+
+# ------------------------------------------------------- coupled pin resolution
+
+
+def test_companion_pin_round_trips_through_the_profile(tmp_path):
+    """The pin must survive CLAUDE_DEPS.md, or `apply` cannot edit it.
+
+    `plan`/`apply` read the committed profile, not a fresh parse, so a pin that
+    renders but does not parse back would silently lose its file:line and the
+    coupled edit would never happen.
+    """
+    pin = CompanionPin(
+        var="HEGEL_LIBHEGEL_VERSION", value="0.29.0",
+        file="CMakeLists.txt", line=123,
+        # Prose containing both a dash and parentheses — the parser works from
+        # the right for exactly this reason.
+        doc="libhegel version required by Hegel C++ v0.7.4 (prebuilt — do not edit)",
+        matched_by="doc",
+    )
+    dep = Dep(name="hegel", kind="cmake-fetchcontent-url", version="0.7.4",
+              declared_in="CMakeLists.txt:115", companion_pins=[pin])
+    text = profile.render([dep], str(tmp_path), {"repo": "r"})
+    back = next(d for d in profile.parse(text)[0] if d.name == "hegel")
+    assert back.companion_pins == [pin]
+
+
+def test_companion_pin_parses_the_pre_structured_form():
+    """A profile written before pins were structured still has to load."""
+    pin = CompanionPin.parse(
+        "HEGEL_LIBHEGEL_VERSION=0.29.0 — CMakeLists.txt:123 (libhegel version required)"
+    )
+    assert (pin.var, pin.value, pin.file, pin.line) == (
+        "HEGEL_LIBHEGEL_VERSION", "0.29.0", "CMakeLists.txt", 123,
+    )
+    assert pin.matched_by == ""  # unknown, not invented
+    assert CompanionPin.parse("not a pin at all") is None
+
+
+def test_var_candidates_strip_the_consumer_namespace():
+    """The consumer namespaces the pin; the dependency declares it plain."""
+    assert companion.var_candidates("HEGEL_LIBHEGEL_VERSION", "hegel") == [
+        "HEGEL_LIBHEGEL_VERSION", "LIBHEGEL_VERSION",
+    ]
+
+
+def test_var_candidates_never_degrade_to_a_generic_name():
+    """`VERSION` upstream is the dependency's own version, not a companion.
+
+    Matching it would confidently report the wrong number, which is worse than
+    reporting nothing.
+    """
+    cands = companion.var_candidates("FOO_BAR_VERSION", "foo")
+    assert "VERSION" not in cands
+    assert all(c.count("_") >= 1 for c in cands)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'set(LIBHEGEL_VERSION 0.31.0 CACHE STRING "x")',
+        'set(LIBHEGEL_VERSION "0.31.0")',
+        "set(\n    LIBHEGEL_VERSION\n    0.31.0\n    CACHE STRING \"x\"\n)",
+        'LIBHEGEL_VERSION = 0.31.0',
+        '"LIBHEGEL_VERSION": "0.31.0"',
+        'set(LIBHEGEL_VERSION v0.31.0)',
+    ],
+)
+def test_find_version_reads_the_common_declaration_forms(text):
+    assert companion.find_version(text, "LIBHEGEL_VERSION")[0] == "0.31.0"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A comparison is not a declaration.
+        "if(LIBHEGEL_VERSION VERSION_LESS 0.31.0)",
+        # A different variable that merely starts the same way.
+        "set(LIBHEGEL_VERSION_MAJOR 0)\nset(OTHER 0.31.0)",
+    ],
+)
+def test_find_version_rejects_non_declarations(text):
+    assert companion.find_version(text, "LIBHEGEL_VERSION")[0] == ""
+
+
+def test_find_in_prose_reads_a_release_note():
+    got, evidence = companion.find_in_prose(
+        "## 0.11.1\n\nRequires libhegel 0.31.0 or newer.", "libhegel"
+    )
+    assert got == "0.31.0"
+    assert "libhegel" in evidence
+
+
+def test_find_in_prose_ignores_a_short_subject():
+    """Two-letter subjects match everywhere; that is noise, not evidence."""
+    assert companion.find_in_prose("ab 1.2.3", "ab") == ("", "")
+
+
+def _hegel_dep():
+    return Dep(
+        name="hegel", kind="cmake-fetchcontent-url", version="0.7.4",
+        declared_in="CMakeLists.txt:2",
+        upstream=Upstream(kind="github", ref="hegeldev/hegel-cpp"),
+        companion_pins=[CompanionPin(
+            var="HEGEL_LIBHEGEL_VERSION", value="0.29.0",
+            file="CMakeLists.txt", line=6,
+            doc="libhegel version required by Hegel C++ v0.7.4",
+            matched_by="name",
+        )],
+    )
+
+
+def _fake_upstream(by_ref):
+    """(fetch, tree) reading a {ref: {path: text}} map instead of the network."""
+    def tree(repo, ref):
+        return list(by_ref.get(ref, {}))
+
+    def fetch(repo, path, ref):
+        return by_ref.get(ref, {}).get(path, "")
+
+    return fetch, tree
+
+
+def test_resolve_reads_the_required_version_from_the_new_tag():
+    """The whole point: work out that 0.11.1 needs libhegel 0.31.0."""
+    fetch, tree = _fake_upstream({
+        "v0.7.4": {"CMakeLists.txt": "set(LIBHEGEL_VERSION 0.29.0 CACHE STRING \"\")"},
+        "v0.11.1": {"CMakeLists.txt": "set(LIBHEGEL_VERSION 0.31.0 CACHE STRING \"\")"},
+    })
+    dep = _hegel_dep()
+    got = companion.resolve(dep, dep.companion_pins[0], "0.11.1", fetch=fetch, tree=tree)
+    assert got["action"] == "bump"
+    assert (got["current"], got["required"]) == ("0.29.0", "0.31.0")
+    assert got["confidence"] == "declared"
+    # Extraction reproduced the value already in the repo, so the answer at the
+    # target tag is trustworthy rather than merely plausible.
+    assert got["self_check"] == "reproduced"
+    assert "v0.11.1" in got["evidence"]
+
+
+def test_resolve_reports_a_companion_that_does_not_move():
+    fetch, tree = _fake_upstream({
+        "v0.7.4": {"CMakeLists.txt": "set(LIBHEGEL_VERSION 0.29.0)"},
+        "v0.8.0": {"CMakeLists.txt": "set(LIBHEGEL_VERSION 0.29.0)"},
+    })
+    dep = _hegel_dep()
+    got = companion.resolve(dep, dep.companion_pins[0], "0.8.0", fetch=fetch, tree=tree)
+    assert got["action"] == "unchanged"
+    assert got["required"] == "0.29.0"
+
+
+def test_resolve_refuses_when_the_self_check_disagrees():
+    """If our reading of the *current* tag contradicts the repo, stop.
+
+    Either the pin is deliberate or we are reading the wrong variable. Both
+    mean the target value is not trustworthy enough to write into a build file.
+    """
+    fetch, tree = _fake_upstream({
+        "v0.7.4": {"CMakeLists.txt": "set(LIBHEGEL_VERSION 0.20.0)"},   # != pinned 0.29.0
+        "v0.11.1": {"CMakeLists.txt": "set(LIBHEGEL_VERSION 0.31.0)"},
+    })
+    dep = _hegel_dep()
+    got = companion.resolve(dep, dep.companion_pins[0], "0.11.1", fetch=fetch, tree=tree)
+    assert got["self_check"] == "diverged"
+    assert got["action"] == "unresolved"
+    assert got["required"] == "0.31.0"  # still reported, just not applied
+    assert any("deliberate" in n for n in got["notes"])
+
+
+def test_resolve_falls_back_to_release_notes_and_says_so():
+    fetch, tree = _fake_upstream({
+        "v0.7.4": {"CMakeLists.txt": "set(LIBHEGEL_VERSION 0.29.0)"},
+        "v0.11.1": {"CMakeLists.txt": "# the pin moved somewhere unreadable\n"},
+    })
+    dep = _hegel_dep()
+    got = companion.resolve(
+        dep, dep.companion_pins[0], "0.11.1",
+        target_notes="Now requires libhegel 0.31.0.", fetch=fetch, tree=tree,
+    )
+    assert got["action"] == "bump"
+    assert got["required"] == "0.31.0"
+    assert got["confidence"] == "notes"
+    assert any("prose" in n for n in got["notes"])
+
+
+def test_resolve_gives_up_rather_than_guessing():
+    fetch, tree = _fake_upstream({
+        "v0.7.4": {"CMakeLists.txt": "set(LIBHEGEL_VERSION 0.29.0)"},
+        "v0.11.1": {"CMakeLists.txt": "# nothing here\n"},
+    })
+    dep = _hegel_dep()
+    got = companion.resolve(dep, dep.companion_pins[0], "0.11.1", fetch=fetch, tree=tree)
+    assert got["action"] == "unresolved"
+    assert got["required"] == ""
+    assert any("not declared" in n for n in got["notes"])
+
+
+def test_resolve_needs_a_readable_upstream():
+    dep = _hegel_dep()
+    dep.upstream = Upstream(kind="distro", ref="libhegel")
+    got = companion.resolve(dep, dep.companion_pins[0], "0.11.1")
+    assert got["action"] == "unresolved"
+    assert any("no readable upstream" in n for n in got["notes"])
+
+
+def test_resolve_finds_a_pin_kept_in_a_cmake_module():
+    """Not every project declares its pins in the root CMakeLists.txt."""
+    fetch, tree = _fake_upstream({
+        "v0.7.4": {
+            "CMakeLists.txt": "project(hegel)\n",
+            "cmake/libhegel.cmake": "set(LIBHEGEL_VERSION 0.29.0)",
+        },
+        "v0.11.1": {
+            "CMakeLists.txt": "project(hegel)\n",
+            "cmake/libhegel.cmake": "set(LIBHEGEL_VERSION 0.31.0)",
+        },
+    })
+    dep = _hegel_dep()
+    got = companion.resolve(dep, dep.companion_pins[0], "0.11.1", fetch=fetch, tree=tree)
+    assert got["required"] == "0.31.0"
+    assert "cmake/libhegel.cmake" in got["evidence"]
+
+
+# ------------------------------------------------------------- atomic two-part edit
+
+
+HEGEL_CMAKE = """\
+FetchContent_Declare(
+    hegel
+    URL https://github.com/hegeldev/hegel-cpp/archive/refs/tags/v0.7.4.tar.gz
+)
+set(
+    HEGEL_LIBHEGEL_VERSION
+    0.29.0
+    CACHE STRING "libhegel version required by Hegel C++ v0.7.4"
+    FORCE
+)
+"""
+
+
+def _hegel_repo(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text(HEGEL_CMAKE)
+    deps, _ = cmake.parse_project(str(tmp_path))
+    return next(d for d in deps if d.name == "hegel")
+
+
+def test_plan_bumps_a_resolved_companion_in_the_same_edit(tmp_path):
+    """Source tarball and prebuilt engine move together or not at all."""
+    dep = _hegel_repo(tmp_path)
+    resolutions = [{
+        "var": "HEGEL_LIBHEGEL_VERSION", "file": "CMakeLists.txt",
+        "line": dep.companion_pins[0].line, "current": "0.29.0",
+        "required": "0.31.0", "action": "bump", "confidence": "declared",
+        "evidence": "hegeldev/hegel-cpp@v0.11.1 CMakeLists.txt: …", "notes": [],
+    }]
+    planned = apply_plan(str(tmp_path), dep, "0.11.1", companions=resolutions)
+
+    assert planned["blocked_on"] == []
+    assert [e["from"] for e in planned["companion_edits"]] == ["0.29.0"]
+    # One file, one edit, both changes inside it.
+    assert len(planned["edits"]) == 1
+    new_text = planned["edits"][0]["_text"]
+    assert "v0.11.1.tar.gz" in new_text
+    assert "0.31.0" in new_text
+    assert "0.29.0" not in new_text
+    # The docstring names the dependency's old version, not the companion's, so
+    # a span-scoped swap must leave it alone.
+    assert "Hegel C++ v0.7.4" in new_text
+
+
+def test_plan_leaves_an_unresolved_companion_alone_and_blocks(tmp_path):
+    dep = _hegel_repo(tmp_path)
+    resolutions = [{
+        "var": "HEGEL_LIBHEGEL_VERSION", "file": "CMakeLists.txt",
+        "line": dep.companion_pins[0].line, "current": "0.29.0",
+        "required": "", "action": "unresolved", "confidence": "", "notes": [],
+    }]
+    planned = apply_plan(str(tmp_path), dep, "0.11.1", companions=resolutions)
+    assert planned["companion_edits"] == []
+    assert planned["blocked_on"] and "HEGEL_LIBHEGEL_VERSION" in planned["blocked_on"][0]
+    assert "0.29.0" in planned["edits"][0]["_text"]  # untouched
+
+
+def test_apply_refuses_on_an_unresolved_companion(tmp_path, monkeypatch, capsys):
+    """The refusal is the feature: a half-bump fails at link time, not at
+    configure time, so the user pays a full build to learn nothing."""
+    from deptool.__main__ import main
+
+    _hegel_repo(tmp_path)
+    monkeypatch.setattr("deptool.__main__._resolve_companions", lambda dep, to: [{
+        "var": "HEGEL_LIBHEGEL_VERSION", "file": "CMakeLists.txt", "line": 5,
+        "current": "0.29.0", "required": "", "action": "unresolved",
+        "confidence": "", "notes": ["not declared upstream at 0.11.1"],
+    }])
+    code = main(["apply", "--root", str(tmp_path), "--dep", "hegel", "--to", "0.11.1"])
+    assert code == 2
+    assert "refusing to bump hegel" in capsys.readouterr().err
+    # Nothing was written.
+    assert "v0.7.4.tar.gz" in (tmp_path / "CMakeLists.txt").read_text()
+    assert not list(tmp_path.glob("*.deptool.bak"))
+
+
+def test_apply_ignore_companions_restores_the_old_behaviour(tmp_path, monkeypatch, capsys):
+    from deptool.__main__ import main
+
+    _hegel_repo(tmp_path)
+    monkeypatch.setattr(
+        "deptool.__main__._resolve_companions",
+        lambda dep, to: pytest.fail("--ignore-companions must not hit the network"),
+    )
+    code = main(["apply", "--root", str(tmp_path), "--dep", "hegel", "--to", "0.11.1",
+                 "--ignore-companions"])
+    assert code == 0
+    text = (tmp_path / "CMakeLists.txt").read_text()
+    assert "v0.11.1.tar.gz" in text
+    assert "0.29.0" in text  # coupled pin deliberately untouched
+
+
+def test_write_and_revert_cover_a_companion_in_another_file(tmp_path):
+    """A coupled pin need not live in the same file as the declaration."""
+    (tmp_path / "CMakeLists.txt").write_text(HEGEL_CMAKE.split("set(")[0])
+    (tmp_path / "cmake").mkdir()
+    (tmp_path / "cmake" / "pins.cmake").write_text(
+        'set(HEGEL_LIBHEGEL_VERSION 0.29.0 CACHE STRING "x")\n'
+    )
+    deps, _ = cmake.parse_project(str(tmp_path))
+    dep = next(d for d in deps if d.name == "hegel")
+    planned = apply_plan(str(tmp_path), dep, "0.11.1", companions=[{
+        "var": "HEGEL_LIBHEGEL_VERSION", "file": os.path.join("cmake", "pins.cmake"),
+        "line": 1, "current": "0.29.0", "required": "0.31.0",
+        "action": "bump", "confidence": "declared", "notes": [],
+    }])
+    assert {e["file"] for e in planned["edits"]} == {
+        "CMakeLists.txt", os.path.join("cmake", "pins.cmake"),
+    }
+
+    from deptool.apply import revert, write
+
+    assert len(write(str(tmp_path), planned)) == 2
+    assert "0.31.0" in (tmp_path / "cmake" / "pins.cmake").read_text()
+    assert revert(str(tmp_path), planned) is True
+    assert "0.29.0" in (tmp_path / "cmake" / "pins.cmake").read_text()
+    assert "v0.7.4" in (tmp_path / "CMakeLists.txt").read_text()
+    assert not list(tmp_path.rglob("*.deptool.bak"))

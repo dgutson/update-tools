@@ -54,8 +54,16 @@ def _swap_version(text: str, old: str, new: str) -> str:
 _declaration_span = declaration_span
 
 
-def plan(root: str, dep: Dep, new_version: str) -> dict:
-    """Work out the edit without touching anything."""
+def plan(root: str, dep: Dep, new_version: str, companions: list[dict] | None = None) -> dict:
+    """Work out the edit without touching anything.
+
+    `companions` are resolutions from `companion.resolve_all`. A resolved one
+    becomes a second edit in the *same* plan — the point of the exercise is that
+    a coupled pin moves atomically with the dependency, because either half on
+    its own is a broken build. An unresolved one is reported in `blocked_on`
+    and deliberately left alone; guessing at an ABI version is worse than
+    stopping.
+    """
     if not dep.declared_in:
         raise ApplyError(f"{dep.name}: no declaration site recorded")
     rel = dep.declared_in.split(":")[0]
@@ -109,6 +117,55 @@ def plan(root: str, dep: Dep, new_version: str) -> dict:
             f"inside the declaration at {dep.declared_in}"
         )
 
+    # rel -> (original, edited). A version swap never adds or removes lines, so
+    # the line numbers recorded at discovery stay valid for a second edit in the
+    # same file — which is the usual case, the companion pin sitting a few lines
+    # below the declaration it belongs to.
+    files: dict[str, tuple[str, str]] = {rel: (text, updated)}
+    companion_edits: list[dict] = []
+    blocked_on: list[str] = []
+
+    for c in companions or []:
+        if c.get("action") != "bump":
+            if c.get("action") == "unresolved":
+                blocked_on.append(
+                    f"{c['var']} (pinned {c.get('current') or '?'}"
+                    + (f", upstream suggests {c['required']}" if c.get("required") else ", unresolved")
+                    + ")"
+                )
+            continue
+        crel = c.get("file") or rel
+        cfull = os.path.join(root, crel)
+        if not os.path.isfile(cfull):
+            blocked_on.append(f"{c['var']} (declared in {crel}, which is missing)")
+            continue
+        if crel not in files:
+            ctext = open(cfull, encoding="utf-8", errors="replace").read()
+            files[crel] = (ctext, ctext)
+        original, current = files[crel]
+        line_no = int(c.get("line") or 0)
+        clo, chi = _declaration_span(current, line_no) if line_no else (0, len(current))
+        cblock = current[clo:chi]
+        new_cblock = _swap_version(cblock, c["current"], c["required"])
+        if new_cblock == cblock:
+            blocked_on.append(
+                f"{c['var']} (could not locate {c['current']} at {crel}:{line_no})"
+            )
+            continue
+        files[crel] = (original, current[:clo] + new_cblock + current[chi:])
+        companion_edits.append({
+            "var": c["var"], "file": crel, "line": line_no,
+            "from": c["current"], "to": c["required"],
+            "evidence": c.get("evidence", ""), "confidence": c.get("confidence", ""),
+            "notes": list(c.get("notes") or []),
+        })
+
+    edits = [
+        {"file": f, "diff": _unified(o, u, f), "_text": u}
+        for f, (o, u) in files.items()
+        if o != u
+    ]
+
     return {
         "dep": dep.name,
         "file": rel,
@@ -117,11 +174,15 @@ def plan(root: str, dep: Dep, new_version: str) -> dict:
         "new_url": new_url,
         "old_hash": dep.integrity,
         "new_hash": new_hash,
-        # Coupled pins this edit does NOT touch. Bumping the source without
-        # its companion is a classic silent breakage: it configures fine and
-        # fails at link time with a missing symbol.
-        "companion_pins": list(dep.companion_pins),
-        "diff": _unified(text, updated, rel),
+        # Coupled pins, with what this plan does about each. A bump that leaves
+        # its companion behind is a classic silent breakage: it configures fine
+        # and fails at link time with a missing symbol.
+        "companion_pins": [p.render() for p in dep.companion_pins],
+        "companions": list(companions or []),
+        "companion_edits": companion_edits,
+        "blocked_on": blocked_on,
+        "edits": edits,
+        "diff": "".join(e["diff"] for e in edits),
         "_text": updated,
     }
 
@@ -137,20 +198,34 @@ def _unified(a: str, b: str, rel: str) -> str:
     )
 
 
-def write(root: str, planned: dict) -> None:
-    full = os.path.join(root, planned["file"])
-    shutil.copy2(full, full + ".deptool.bak")
-    with open(full, "w", encoding="utf-8") as fh:
-        fh.write(planned["_text"])
+def _edits_of(planned: dict) -> list[dict]:
+    return planned.get("edits") or [
+        {"file": planned["file"], "_text": planned.get("_text", "")}
+    ]
+
+
+def write(root: str, planned: dict) -> list[str]:
+    """Apply every edit in the plan. Returns the files written."""
+    written = []
+    for edit in _edits_of(planned):
+        full = os.path.join(root, edit["file"])
+        shutil.copy2(full, full + ".deptool.bak")
+        with open(full, "w", encoding="utf-8") as fh:
+            fh.write(edit["_text"])
+        written.append(edit["file"])
+    return written
 
 
 def revert(root: str, planned: dict) -> bool:
-    full = os.path.join(root, planned["file"])
-    bak = full + ".deptool.bak"
-    if not os.path.isfile(bak):
-        return False
-    shutil.move(bak, full)
-    return True
+    """Restore every backup this plan made. True if anything was restored."""
+    restored = False
+    for edit in _edits_of(planned):
+        full = os.path.join(root, edit["file"])
+        bak = full + ".deptool.bak"
+        if os.path.isfile(bak):
+            shutil.move(bak, full)
+            restored = True
+    return restored
 
 
 def _run(cmd: list[str], root: str, timeout: int) -> dict:

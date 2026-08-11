@@ -14,7 +14,7 @@ import os
 import re
 from dataclasses import dataclass
 
-from .model import Dep, Upstream, most_restrictive
+from .model import CompanionPin, Dep, Upstream, most_restrictive
 
 # Conditions that mean "this block only matters for tests / examples / docs".
 _TEST_COND = re.compile(r"\b(BUILD_TESTING|BUILD_TESTS?|ENABLE_TESTS?|\w*_TESTS?)\b", re.I)
@@ -542,11 +542,15 @@ def _attach_companions(dep: Dep, cache_vars: list[dict]) -> None:
         )
         if not (by_name or by_doc or by_place):
             continue
-        entry = f"{cv['var']}={cv['value']} — {cv['file']}:{cv['line']}"
-        if cv["doc"]:
-            entry += f" ({cv['doc']})"
-        if entry not in dep.companion_pins:
-            dep.companion_pins.append(entry)
+        # Strongest reason first — the resolver and the report both weight a
+        # proximity-only match lower than a named one.
+        matched_by = "name" if by_name else ("doc" if by_doc else "proximity")
+        pin = CompanionPin(
+            var=cv["var"], value=cv["value"], file=cv["file"], line=cv["line"],
+            doc=cv["doc"] or "", matched_by=matched_by,
+        )
+        if not any(p.var == pin.var and p.where() == pin.where() for p in dep.companion_pins):
+            dep.companion_pins.append(pin)
 
     if dep.companion_pins:
         dep.notes.append(

@@ -63,6 +63,78 @@ def _gh_api(path: str):
     return _http_json(f"https://api.github.com/{path.lstrip('/')}", hdr)
 
 
+# --------------------------------------------------------- files at a ref
+#
+# Companion-pin resolution needs to read a dependency's *own* build files at
+# the tag we are considering upgrading to: that is where upstream states which
+# version of its prebuilt engine / ABI level / protocol it requires.
+
+MAX_FILE_BYTES = 512 * 1024
+
+
+def _http_text(url: str, headers: dict | None = None) -> str:
+    req = urllib.request.Request(url, headers={**UA, **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            return r.read(MAX_FILE_BYTES).decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError):
+        return ""
+
+
+def fetch_file(repo: str, path: str, ref: str) -> str:
+    """One file from a GitHub repo at a ref; "" when unavailable.
+
+    raw.githubusercontent first — it costs no API quota. The contents API via
+    `gh` is the fallback, which is also what makes this work for a private
+    dependency.
+    """
+    text = _http_text(f"https://raw.githubusercontent.com/{repo}/{ref}/{path.lstrip('/')}")
+    if text:
+        return text
+    data = _gh_api(f"repos/{repo}/contents/{path.lstrip('/')}?ref={ref}")
+    if isinstance(data, dict) and data.get("encoding") == "base64":
+        import base64
+
+        try:
+            return base64.b64decode(data.get("content") or "").decode("utf-8", "replace")
+        except (ValueError, TypeError):
+            return ""
+    return ""
+
+
+def list_files(repo: str, ref: str) -> list[str]:
+    """Blob paths in a repo at a ref. Empty list when the tree is unavailable."""
+    data = _gh_api(f"repos/{repo}/git/trees/{ref}?recursive=1")
+    if not isinstance(data, dict):
+        return []
+    return [
+        e.get("path", "")
+        for e in (data.get("tree") or [])
+        if isinstance(e, dict) and e.get("type") == "blob" and e.get("path")
+    ]
+
+
+def tag_forms(version: str, versions: list[dict] | None = None) -> list[str]:
+    """Candidate git refs for a version, best first.
+
+    Prefers the tag upstream actually published; falls back to both the `v`-
+    prefixed and bare spellings, since a resolver that guesses wrong just gets
+    an empty file back and moves on.
+    """
+    out: list[str] = []
+    target = parse_version(version)
+    for v in versions or []:
+        tag = v.get("tag") or ""
+        if not tag:
+            continue
+        if v.get("version") == version or (target and parse_version(v.get("version", "")) == target):
+            out.append(tag)
+    for cand in (f"v{version}", version):
+        if cand and cand not in out:
+            out.append(cand)
+    return out
+
+
 # ------------------------------------------------------------------ providers
 
 
@@ -252,6 +324,15 @@ def summarise(dep: Dep, allow_prerelease: bool = False) -> dict:
         }
     ahead = newer_than(current, versions, allow_prerelease)
     latest = ahead[0]["version"] if ahead else current
+    # The tag spelling for the version in use, so companion-pin resolution can
+    # read the dependency's build files at exactly that ref instead of guessing.
+    cur_parsed = parse_version(current)
+    current_tag = next(
+        (v.get("tag", "") for v in versions
+         if v.get("version") == current
+         or (cur_parsed and parse_version(v.get("version", "")) == cur_parsed)),
+        "",
+    )
 
     if not current:
         # An unpinned system dependency has no version gap to measure: the
@@ -274,6 +355,7 @@ def summarise(dep: Dep, allow_prerelease: bool = False) -> dict:
         "resolved": True,
         "unpinned": False,
         "current": current,
+        "current_tag": current_tag,
         "latest": latest,
         "behind_by": len(ahead),
         "bump": bump_kind(current, latest) if ahead else "same",

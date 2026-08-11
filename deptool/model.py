@@ -35,6 +35,90 @@ class Site:
 
 
 @dataclass
+class CompanionPin:
+    """A version-valued variable that must move together with a dependency.
+
+    The observed case: a source tarball pinned at one version plus its prebuilt
+    native engine pinned separately in a CACHE variable. Bumping one alone
+    configures cleanly and fails at link time with a missing symbol — a failure
+    that looks nothing like a dependency problem.
+
+    Structured rather than a formatted string because `apply` has to *edit*
+    these, which needs the file and line, and the resolver has to look the
+    variable up in the dependency's own build files upstream, which needs the
+    name.
+    """
+
+    var: str
+    value: str
+    file: str = ""
+    line: int = 0
+    doc: str = ""  # the CACHE docstring, when there is one
+    # Why we believe this belongs to the dependency: name | doc | proximity.
+    # Proximity is the weakest and the report says so.
+    matched_by: str = ""
+
+    def where(self) -> str:
+        return f"{self.file}:{self.line}" if self.file else ""
+
+    def render(self) -> str:
+        """One line, human-readable, round-trips through `parse`."""
+        out = f"{self.var}={self.value}"
+        if self.file:
+            out += f" — {self.where()}"
+        if self.doc:
+            out += f" ({self.doc})"
+        if self.matched_by:
+            out += f" [matched by {self.matched_by}]"
+        return out
+
+    @classmethod
+    def parse(cls, item: str) -> "CompanionPin | None":
+        """Recover a pin from its rendered form in CLAUDE_DEPS.md.
+
+        Parsed from the right, because the CACHE docstring is free prose and
+        may itself contain ` — ` or parentheses.
+        """
+        text = item.strip()
+        matched_by = ""
+        m = re.search(r"\s*\[matched by ([^\]]+)\]$", text)
+        if m:
+            matched_by = m.group(1).strip()
+            text = text[: m.start()]
+
+        doc = ""
+        if text.endswith(")"):
+            depth, i = 0, len(text) - 1
+            while i >= 0:
+                if text[i] == ")":
+                    depth += 1
+                elif text[i] == "(":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i -= 1
+            if i > 0:
+                doc = text[i + 1 : -1]
+                text = text[:i].rstrip()
+
+        head, _, where = text.partition(" — ")
+        var, sep, value = head.partition("=")
+        if not sep or not var.strip() or not value.strip():
+            return None
+        file, line = "", 0
+        if where.strip():
+            fpart, _, lpart = where.strip().rpartition(":")
+            if fpart and lpart.isdigit():
+                file, line = fpart, int(lpart)
+            else:
+                file = where.strip()
+        return cls(
+            var=var.strip(), value=value.strip(), file=file, line=line,
+            doc=doc, matched_by=matched_by,
+        )
+
+
+@dataclass
 class Upstream:
     """Where to look for newer versions."""
 
@@ -68,7 +152,7 @@ class Dep:
     notes: list[str] = field(default_factory=list)
     # Version-valued CACHE variables that must move together with this
     # dependency (e.g. a source tarball plus its prebuilt native engine).
-    companion_pins: list[str] = field(default_factory=list)
+    companion_pins: list[CompanionPin] = field(default_factory=list)
     # Prose written by Claude and preserved across regenerations.
     assessment: str = ""
     # Fingerprint as recorded in CLAUDE_DEPS.md, for drift detection.
@@ -96,6 +180,14 @@ class Dep:
         d = dict(d)
         d["upstream"] = Upstream(**d.get("upstream", {}) or {})
         d["sites"] = [Site(**s) for s in d.get("sites", []) or []]
+        # Tolerate the pre-structured form: a profile written by an older
+        # version records companion pins as plain rendered strings.
+        pins = []
+        for c in d.get("companion_pins", []) or []:
+            pin = CompanionPin(**c) if isinstance(c, dict) else CompanionPin.parse(str(c))
+            if pin:
+                pins.append(pin)
+        d["companion_pins"] = pins
         known = {f.name for f in dataclasses.fields(cls)}
         return cls(**{k: v for k, v in d.items() if k in known})
 

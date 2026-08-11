@@ -30,9 +30,9 @@ cd "${CLAUDE_PLUGIN_ROOT}" && python3 -m deptool --root <repo> <verb>
 | `profile` | (Re)generate `CLAUDE_DEPS.md`. Preserves existing `### Assessment` prose unless `--force`. | no |
 | `status` | Is `CLAUDE_DEPS.md` stale? Pure content hashing. | no |
 | `check` | Full evidence: versions, release notes, advisories, consumed symbols. `--json` for structure. | yes |
-| `plan --dep N --to V` | Show the exact edit for a bump, including the re-computed archive hash. Writes nothing. | yes |
-| `apply --dep N --to V [--verify]` | Write the bump, optionally configure/build/test. Leaves a `.deptool.bak`. | yes |
-| `revert --dep N` | Restore the backup. | no |
+| `plan --dep N --to V` | Show the exact edit for a bump, including the re-computed archive hash and any coupled pin. Writes nothing. | yes |
+| `apply --dep N --to V [--verify]` | Write the bump *and its coupled pins*, optionally configure/build/test. Leaves a `.deptool.bak` per file. | yes |
+| `revert --dep N` | Restore the backups. | no |
 
 Use `--json` when you need to reason over the data; use plain output when you
 are just showing the user progress.
@@ -76,6 +76,43 @@ prose, and confirm before running it.
 4. If verification fails, show the failing output and offer `revert`.
 5. Never apply more than one dependency at a time without asking. When a build
    breaks, one change at a time is what makes it diagnosable.
+6. If `apply` **refuses** (exit 2, unresolved coupled pin), do not reach for
+   `--ignore-companions` to get past it. See below.
+
+### Coupled pins
+
+A dependency can be pinned twice: the source *and* a companion version — a
+prebuilt native engine, an ABI level, a protocol version, a toolchain minimum.
+`plan` and `apply` resolve the companion by reading the dependency's own build
+files at the tag being moved to, and bump both in one edit. Each resolution
+carries an `action` you should read before recommending anything:
+
+| `action` | Meaning | What to say |
+|---|---|---|
+| `bump` | Resolved; both edits are in the plan. | Report it as part of the change, with the `evidence` line. |
+| `unchanged` | The companion does not move at the target version. | Say the coupling is not an obstacle here. |
+| `unresolved` | Could not be established. `apply` refuses. | Say what is missing and stop. |
+
+`confidence: declared` means the value came from an upstream declaration.
+`confidence: notes` means it came from prose in release notes — repeat that
+caveat to the user rather than presenting it as fact.
+
+`self_check` is the field that tells you whether to trust any of it. It reports
+whether the same extraction reproduces the value **already** in the repo at the
+**currently pinned** version:
+
+- `reproduced` — the mechanism demonstrably works for this dependency.
+- `diverged` — upstream at the pinned version declares something *different*
+  from what the repo pins. That is a finding in its own right, and worth
+  raising even when no upgrade is due: either the pin was set deliberately (so
+  there is a reason nobody wrote down) or the wrong variable is being read.
+- `unavailable` — no cross-check was possible, so the value is unverified.
+
+**`--ignore-companions` is not a way to make a refusal go away.** It bumps the
+dependency alone, which is the exact failure this detection exists to prevent:
+the build configures cleanly and dies at link time with a missing symbol, which
+reads like a compiler problem. Offer it only when the user has established the
+pins are genuinely independent, and say what it disables.
 
 ## The rubric
 

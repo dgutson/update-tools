@@ -72,7 +72,7 @@ from zeta-daw:
   - tests/configuration_test.cpp:4 — #include <hegel/hegel.h>
   - tests/loop_slot_fsm_test.cpp:49 — hegel::stateful
 - companion-pins:
-  - HEGEL_LIBHEGEL_VERSION=0.29.0 — CMakeLists.txt:123 (libhegel version required by Hegel C++ v0.7.4)
+  - HEGEL_LIBHEGEL_VERSION=0.29.0 — CMakeLists.txt:123 (libhegel version required by Hegel C++ v0.7.4) [matched by name]
 - scope-evidence:
   - declared under test guard at CMakeLists.txt:115
   - linked only into: configuration_tests, loop_timing_tests, midi_tests, …
@@ -113,16 +113,60 @@ source alone and the build configures cleanly, then dies at link time:
 undefined reference to `hegel_settings_set_stateful_step_count'
 ```
 
-That reads like a compiler problem, not a dependency problem. `deps` detects
-the coupling and warns before you apply:
+That reads like a compiler problem, not a dependency problem. `deps` detects the
+coupling, then works out what the companion has to become by reading the
+dependency's *own* build files at the tag you are moving to — and bumps both in
+one edit:
 
 ```
-WARNING: coupled pin(s) this edit does NOT change —
-  HEGEL_LIBHEGEL_VERSION=0.29.0 — CMakeLists.txt:123 (libhegel version required by Hegel C++ v0.7.4)
-  bumping the source alone may fail at link time.
+$ deptool plan --dep grpc --to 1.68.0
+grpc: 1.60.0 -> 1.68.0 in CMakeLists.txt
+coupled pins:
+  +> GRPC_CORE_VERSION 37.0.0 -> 44.1.0  [declared]
+     grpc/grpc@v1.68.0 CMakeLists.txt: set(gRPC_CORE_VERSION "44.1.0")
+     ! the CACHE docstring still says 1.60.0 and will be stale after the bump
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -5,11 +5,11 @@
+ FetchContent_Declare(
+     grpc
+-    URL https://github.com/grpc/grpc/archive/refs/tags/v1.60.0.tar.gz
++    URL https://github.com/grpc/grpc/archive/refs/tags/v1.68.0.tar.gz
+ )
+ set(
+     GRPC_CORE_VERSION
+-    37.0.0
++    44.1.0
 ```
 
-Resolving the companion version automatically is [roadmap item 1](ROADMAP.md).
+The value is evidence, not inference: it is quoted from a declaration upstream,
+and it is cross-checked before being used. `deps` resolves the same variable at
+the version **currently** pinned and compares it with what the repo already
+says. If our reading reproduces the existing pin, the mechanism demonstrably
+works for this dependency. If it disagrees, that is reported as a finding and
+nothing is written — either the pin was set deliberately, or the wrong variable
+is being read, and both need a human.
+
+When the companion cannot be resolved at all, `apply` **refuses**:
+
+```
+$ deptool apply --dep grpc --to 1.68.0
+refusing to bump grpc: unresolved coupled pin(s) — GRPC_NO_SUCH_PIN_VERSION (pinned 37.0.0, unresolved)
+  !? GRPC_NO_SUCH_PIN_VERSION 37.0.0 -> unknown
+     ! not declared in any build file read at 1.68.0 and not mentioned in its
+       release notes — bumping grpc alone risks the link-time failure this pin
+       exists to prevent
+  set them by hand, or re-run with --ignore-companions to bump only grpc.
+```
+
+Refusing is the useful behaviour here: half the bump configures cleanly and
+fails after a full build, having told you nothing. `--ignore-companions` is
+available for the case where you have established the pins really are
+independent.
+
+Companion resolution reads the root `CMakeLists.txt` first, then `cmake/`
+modules and other build metadata at that tag, and falls back to release-note
+prose — marked as such, because prose is the weakest evidence in this tool.
 
 ## Analysis backends
 
