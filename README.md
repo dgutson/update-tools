@@ -5,17 +5,34 @@ you should care.
 
 It builds a **usage profile** of your project — not a dependency list, but a
 record of which symbols your code actually consumes from each library — then
-intersects upstream release notes with that surface. A changelog entry only
-matters if it touches something you call.
+intersects what changed upstream with that surface. A change only matters if it
+touches something you call.
+
+For C/C++ it does not take the changelog's word for what changed: it diffs the
+library's **public headers** between the tag you are pinned to and the tag you
+are considering, and intersects the result with your call sites.
 
 ```
 ^  hegel        0.7.4 -> 0.11.1  (6 behind, minor, scope=test)
    we call: HEGEL_TEST, hegel::TestCase, hegel::generators, hegel::stateful
-^  fluidsynth   2.3.4 -> 2.5.7   (20 behind, minor, scope=runtime)
-   we call: fluid_synth_noteon, fluid_synth_cc, fluid_synth_sfload …  (19 total)
+^  fluidsynth   2.3.4 -> 2.6.0   (21 behind, minor, scope=runtime)
+   we call: FLUID_FAILED, fluid_ramsfont_t, fluid_synth_noteon, new_fluid_synth …
    graphify: 8 direct callers, 10 functions transitively reach it
+   api: v2.3.4 -> v2.6.0, 17/17 public header(s)
+     !! fluid_ramsfont_t — removed (alias) at src/audio.cpp:4
 =  libremidi    5.4.3 — current
 ```
+
+That last finding is not from a changelog. FluidSynth dropped the
+`fluid_ramsfont` API in 2.4.0; the tool established it by reading the headers at
+both tags and matching the result against a type this project uses at a specific
+line.
+
+Note what kind of thing it is. `fluid_ramsfont_t` is a **type**, `FLUID_FAILED`
+an **enum constant**, `new_fluid_synth` a constructor that does not carry the
+library's prefix — none of them a `prefix_name(` call. Most of a C library's API
+is not shaped like a function call, and a breaking change in the part you cannot
+see is one you never hear about.
 
 ## Why this exists
 
@@ -30,6 +47,107 @@ matters if it touches something you call.
 None of them read *your* code to see how you use the library, and none handle
 the three worlds a C++ project lives in at once: fetched archives, pkg-config
 system libraries, and `find_package`.
+
+## "Isn't this an SCA tool?"
+
+Reasonable question, and the answer decides how much of this repo should exist.
+Software Composition Analysis tools are very good at *finding* dependencies, so
+`deps` should not be rebuilding that. Below is what five of them actually cover
+across the two languages this targets, read from their source in **2026-08**
+rather than from their marketing.
+
+The short version: **dependency discovery is a solved problem in every ecosystem
+except CMake, and no SCA tool answers "is it worth upgrading".** So `deps` should
+ingest them for discovery and spend its own effort on the judgement.
+
+### Coverage matrix
+
+`extract` = produces a usable dependency list. `fingerprint` = identifies the
+project itself for CVE matching, which is not the same thing and is easy to
+mistake for it.
+
+| | C (autotools, pkg-config) | C++ (CMake, Conan, vcpkg) | Python |
+|---|---|---|---|
+| **[ORT](https://oss-review-toolkit.org/ort/docs/tools/analyzer)** | — | Conan 1.x/2.x, Bazel (docs say limited). No CMake. | Pip, Pipenv, Poetry. **No uv.** |
+| **[Trivy](https://github.com/aquasecurity/trivy)** | — | Conan only (`parser/c/` has exactly one entry) | pip, pipenv, poetry, pyproject, pylock, **uv** |
+| **[OWASP Dependency-Check](https://owasp.org/www-project-dependency-check/)** | `AutoconfAnalyzer` — *fingerprint* | `CMakeAnalyzer` — *fingerprint* | requirements.txt, Pipfile(.lock), poetry.lock — all `@Experimental`. **No uv.** |
+| **[dependabot-core](https://github.com/dependabot/dependabot-core)** | — | **vcpkg**, bazel. No CMake, no Conan. | pip, pip-compile, pipenv, poetry, **uv** (own top-level ecosystem) |
+| **[OpenSCA](https://github.com/xmirrorsecurity/opensca-cli)** | — | — | Pipfile(.lock), setup.py, requirements.txt/.in. **No poetry, no uv.** |
+
+### Where that leaves each language
+
+**C++ — nothing parses CMake dependencies.** Not one of the five. ORT's
+documented fallback for an unsupported build system is to hand-write an ORT
+project file or supply an SPDX document. Dependency-Check *has* a `CMakeAnalyzer`,
+which looks like a counterexample until you read it: it is `@Experimental`, runs
+in phase `INFORMATION_COLLECTION`, and matches only `project(NAME)`,
+`set(VERSION …)` and `set(<name>_version …)`, calling
+`addEvidence(VENDOR/PRODUCT/VERSION)`. Occurrences in that file of
+`FetchContent`, `find_package`, `pkg_check_modules`, `CPMAddPackage`, `URL_HASH`,
+`GIT_TAG`, `ExternalProject` and `target_link_libraries`: **zero each**. It
+identifies the directory; it does not read what the directory depends on.
+
+One detail makes the category difference exactly: Dependency-Check's
+`set(<name>_version "…")` pattern is the same syntactic shape `deps` detects as a
+[coupled pin](#coupled-pins). DC reads it as *"a product — look up its CVEs."*
+`deps` reads it as *"a pin bound to another declaration — and here is the value
+it must take at the target tag."* Same bytes, different question.
+
+**C — same gap, same reason.** Dependency-Check's `AutoconfAnalyzer` is the
+autotools twin of its CMake one: `@Experimental`, matches `AC_INIT` and package
+variables in `configure.ac`, emits `addEvidence(PRODUCT/VENDOR/VERSION)`. It
+fingerprints the project. A C project built with autotools and `pkg-config`
+therefore has no dependency extractor in any of the five.
+
+**Python — well covered, and `deps` is the weak one.** This is where the
+challenge lands. dependabot-core ships, *per ecosystem*, a `file_fetcher`,
+`file_parser`, `update_checker`, **`file_updater`** and a `metadata_finder` with
+`changelog_finder` / `release_finder` / **`commits_finder`**. That is: find the
+manifests, parse them, resolve the newest allowed version, **edit the manifest**,
+and fetch the changelog, the release and the commits between two versions — four
+of this tool's five deterministic layers, across ~35 ecosystems. Anything `deps`
+adds by hand here is duplicated work, which is why the roadmap's "write more
+parsers" item was deleted.
+
+### Two findings that shaped the design
+
+**Only Trivy and dependabot know about `uv`.** ORT, Dependency-Check and OpenSCA
+have no uv support at all. If uv matters to you, those three cannot see your
+dependencies.
+
+**Almost nothing records *where* a dependency is declared.** This is the
+structural reason `deps` keeps its own parsers rather than becoming a pure
+frontend. To bump a pin you need the line, not the package name:
+
+| Tool | Declaration location |
+|---|---|
+| Trivy | `Package.Locations[]{StartLine, EndLine}` — **populated** for `pip` (requirements.txt), `pom`, `conan`, `cargo`; **not** for `uv`, `poetry`, `pyproject`, `package.json`, `go.mod` |
+| dependabot-core | file only — a requirement is `{requirement, file, groups, source}`; `dependency.rb` contains no line concept. Its `file_updater` re-parses content instead. |
+| ORT | file only — `Project.definitionFilePath`. `Project.kt`, `Package.kt`, `PackageReference.kt` and `Scope.kt` contain no line concept at all. |
+| Dependency-Check | file only, as CPE evidence |
+
+So a dependency ingested from an SCA tool is **report-only** in `deps`: it can be
+profiled, judged and reported, but `apply` refuses to edit it rather than
+guessing. That, not ecosystem coverage, is why the small native parsers stay.
+
+### What is left that is genuinely this tool's job
+
+Deliberately a short list:
+
+1. **CMake / `pkg-config` / `FetchContent` discovery**, with the declaration site
+   and raw pin needed to rewrite and re-hash. Nothing else does it.
+2. **The usage profile** — which symbols of a dependency your code consumes, with
+   `file:line`. Not a question SCA asks.
+3. **The API-surface diff** and its intersection with that profile. Dependabot
+   fetches the changelog; it does not check the changelog against the headers.
+4. **Coupled pins** — detection *and* resolution against upstream's own build
+   files at the target tag.
+5. **The judgement.** The whole point, and the one part that is not a parsing
+   problem.
+
+That Dependabot and Renovate have excellent parsers is an argument for consuming
+them, not for competing with them. See [ROADMAP item 7](ROADMAP.md) for the
+ingest plan.
 
 ## Install
 
@@ -87,12 +205,14 @@ Test-only; never linked into the shipped binary, so the blast radius of a
 bump is confined to CI. …
 ```
 
-Four things make this more than a copy of the manifest:
+Five things make this more than a copy of the manifest:
 
 - **`consumed` / `sites`** — the API surface, which is what turns a changelog
   into a decision.
 - **`scope-evidence`** — *why* it concluded test-only, so you can disagree.
 - **`companion-pins`** — coupled versions that must move together (see below).
+- **`declarations`** — every place the dependency is pinned, when there is more
+  than one (see [Manifests that disagree](#manifests-that-disagree)).
 - **`### Assessment`** — prose written by Claude and **preserved across
   regenerations**. This is the accumulated understanding of what each
   dependency means to your project, and the reason the file gets more useful
@@ -102,6 +222,39 @@ The `fingerprint` lines hash each dependency's *own declaration block*, not its
 file — so editing one dep in a shared `CMakeLists.txt` marks only that dep as
 drifted. `/deps:sync` detects drift by hashing alone; no model call is needed
 to notice that nothing changed.
+
+## Manifests that disagree
+
+A cross-platform project often keeps one manifest per target — a Conan file for
+each of Linux, macOS and two Windows variants — and over time they drift apart.
+Nothing about that is visible upstream: every version involved may be perfectly
+current, so an update checker has nothing to say.
+
+`deps` looks for manifests **anywhere in the tree**, keeps every declaration it
+finds, and reports the disagreement as a finding of its own:
+
+```
+!= openssl          declarations disagree on the version — 3.2.1 in
+   deps/linux/conanfile.txt:4, deps/macos/conanfile.txt:4; 3.5.0 in
+   deps/windows/conanfile.txt:4 — so what ships depends on which manifest
+   the build used
+```
+
+Two consequences worth knowing:
+
+- The version compared against upstream is the **oldest** of the declared ones —
+  the copy an advisory is most likely to match. "Two versions behind" is then the
+  gap for the worst platform, and `declarations` says where the others are.
+- `/deps:apply` **refuses** a dependency whose manifests disagree, rather than
+  editing one and deepening the split. When they agree it bumps all of them in a
+  single plan.
+
+The same reconciliation fixes a quieter wrong answer. `find_package(CURL)` and a
+`libcurl/8.9.0` pin are the same library under two names; left separate, the
+version-less CMake declaration wins and the tool ends up comparing *your machine's*
+system library against what distros ship — recommending a CI-image change for a
+library the project statically links from its own manifest. The two declarations
+are now folded into one dependency, with both names and both sites kept.
 
 ## Coupled pins
 
@@ -168,6 +321,62 @@ Companion resolution reads the root `CMakeLists.txt` first, then `cmake/`
 modules and other build metadata at that tag, and falls back to release-note
 prose — marked as such, because prose is the weakest evidence in this tool.
 
+## Not trusting the changelog
+
+Release notes are the weakest evidence in a tool like this — often absent, often
+marketing, never written with *your* call sites in mind. For a C/C++ dependency
+the API surface is not a matter of opinion, so `deps` reads it directly:
+
+```
+$ deptool apidiff --dep fluidsynth --to 2.5.7
+fluidsynth 2.3.4 -> 2.5.7 (FluidSynth/fluidsynth v2.3.4...v2.5.7)
+  626 public declaration(s) -> 641, read 17/17 header(s)
+    !! fluid_ramsfont_t — removed (alias) at src/audio.cpp:4
+```
+
+The surface is functions, types, aliases, macros **and enum constants** — a
+renamed enumerator is as hard a compile break as a deleted function, and reading
+only the enum's own tag left every constant you consume permanently unchecked.
+A public header that exists in the repository only as a build-time template
+(`src/sndfile.h.in`) counts too: libsndfile keeps its entire C API there, so
+skipping it meant reading twenty *internal* headers and never seeing `sf_open`.
+
+Three rules keep it from crying wolf, which matters more than coverage:
+
+- **A removal must be absent from every header read at the target**, not just
+  from the one it used to live in. Upstream moving a declaration between headers
+  is routine and breaks nobody.
+- **An incomplete read never reports a clean bill of health.** Big libraries
+  exceed the per-dependency header budget, so headers naming a subsystem you
+  consume are read first, and any symbol the diff never saw is listed separately
+  as `not_located` — *unchecked, not unaffected*. Symbols you consume that look
+  removed get a second, targeted search of the skipped headers before anything
+  is reported.
+- **An empty intersection with an empty input is not a result.** If nothing is
+  known about what you consume, then "nothing you consume changed" is a fact
+  about the extractor and not about the upgrade, and it is reported as
+  *unmeasured, not unaffected*.
+
+Noise suppression is deliberate and each rule came from a real false positive:
+renaming a parameter is not a signature change, adding `override` to a virtual
+is not a signature change, `FLUID_RESTRICT` on a parameter is not a type change,
+renaming the opaque struct behind a handle typedef is not a change to the handle
+(libsndfile did exactly that to `SNDFILE`, which every caller uses and none can
+see inside), and an include guard is not API. Where a project has an `include/`
+tree, nothing
+outside it counts — FluidSynth's real surface is 17 headers, and counting `src/`
+turned internal churn into 33 "removals" no consumer could have called.
+
+Renames are reported as `[inferred]` — a removed and an added symbol sharing a
+signature and a similar name — because a rename cannot be proved from two
+snapshots.
+
+Two prose fallbacks fill the gap for everything that is not a C/C++ header:
+upstream's own `UPGRADING.md` / `UPGRADE-6.4.md` at the target tag (discovered
+from the repo listing, and narrowed to the guides covering the versions you are
+actually crossing), and the commit log between the two tags — used **only** when
+the release notes are empty, with the subjects that announce a break flagged.
+
 ## Analysis backends
 
 Consumed-symbol extraction is pluggable and auto-detected:
@@ -180,6 +389,36 @@ Consumed-symbol extraction is pluggable and auto-detected:
 
 `builtin` always runs — it produces the auditable `file:line` sites. A graph
 backend enriches rather than replaces. Nothing breaks if you have neither.
+
+### How a symbol gets attributed to a library
+
+Everything above depends on this list, so it is worth knowing how it is built and
+where it stops. `builtin` attributes a file to a dependency by its `#include`,
+then harvests from that file in three ways:
+
+- **`ns::Name`**, for a C++ library with a namespace.
+- **the library's own prefix**, when that prefix ends in `_` and so acts as a
+  namespace marker — `fluid_synth_t` counts whether or not it is being called,
+  and so does `new_fluid_synth`, which carries the prefix in the middle. A prefix
+  that is a bare stem instead (zlib's `deflate`, `compress`) still has to look
+  like a call, because such a token is about as likely to be an English word.
+- **upstream's own declared names.** The prefix comes from the *package* name,
+  which is often not the API's: libsndfile yields `sndfile_`, its API is `sf_open`
+  and `SF_INFO`, and the guess matches nothing at all. So the header diff feeds
+  its own reading back — a name upstream declares that your sources mention is
+  consumed, no guess required. It costs no extra fetches, since those headers
+  were read anyway, and names *your* code declares are excluded so your `Node`
+  stays yours rather than becoming yaml-cpp's.
+
+Comments, string literals and include paths are not uses, so a symbol named in a
+log message does not count. Where the harvest comes back empty on a dependency
+your code demonstrably includes, that is recorded as a gap in the profile rather
+than left to look like an unused dependency.
+
+What it still misses, all of it on the [roadmap](ROADMAP.md): a method called on
+an object of a dependency's type (`node.as<int>()`), a symbol reached only
+through one of your own `typedef`s, and enum *values* — a reordered enum is an
+ABI break that reads as unchanged.
 
 To use graphify:
 
@@ -198,6 +437,12 @@ ones.
 
 **Others** — npm, Cargo, PyPI (`pyproject.toml` / `requirements.txt`), Go
 modules.
+
+**Manifests anywhere in the tree**, not just at the repository root, so a project
+keeping one manifest per target platform in subdirectories is read properly —
+including when those manifests contradict each other. Build output, package
+caches and trees declared as submodules in `.gitmodules` are skipped, since a
+vendored project's manifest declares *its* dependencies rather than yours.
 
 **Unpinned system libraries** get honest treatment: there is no version in the
 repo to bump, so it reports what is installed locally versus what distros ship
@@ -230,13 +475,17 @@ The plugin is a wrapper; the tool stands alone.
 python3 -m deptool --root ~/src/zeta-daw profile      # write CLAUDE_DEPS.md
 python3 -m deptool --root ~/src/zeta-daw status       # drifted? (no network)
 python3 -m deptool --root ~/src/zeta-daw check        # upgrade evidence
+python3 -m deptool --root ~/src/zeta-daw apidiff --dep fluidsynth --to 2.5.7
 python3 -m deptool --root ~/src/zeta-daw plan  --dep hegel --to 0.11.1
 python3 -m deptool --root ~/src/zeta-daw apply --dep hegel --to 0.11.1 --verify
 python3 -m deptool --root ~/src/zeta-daw revert --dep hegel
 ```
 
-`--json` on `profile`, `status` and `check` gives machine-readable output.
-`plan` writes nothing; `apply` leaves a `.deptool.bak` beside the edited file.
+`--json` on `profile`, `status`, `check` and `apidiff` gives machine-readable
+output. `plan` writes nothing; `apply` leaves a `.deptool.bak` beside the edited
+file. `check` runs the header diff automatically for C/C++ dependencies with a
+readable GitHub upstream; `--no-api-diff` skips it and `--max-headers N` widens
+the budget.
 
 ## Development
 

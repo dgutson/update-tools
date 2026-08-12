@@ -7,6 +7,7 @@ this output as input.
     python3 -m deptool profile   [--root R] [--json]
     python3 -m deptool status    [--root R] [--json]
     python3 -m deptool check     [--root R] [--json] [--pre] [--only NAME]
+    python3 -m deptool apidiff   --dep NAME [--to VERSION] [--from VERSION]
     python3 -m deptool plan      --dep NAME --to VERSION [--root R]
     python3 -m deptool apply     --dep NAME --to VERSION [--root R] [--verify]
     python3 -m deptool revert    --dep NAME --to VERSION [--root R]
@@ -14,6 +15,11 @@ this output as input.
 `plan` and `apply` also resolve coupled pins — a second version that must move
 with the dependency — and bump them in the same edit. `apply` refuses when one
 cannot be resolved; `--ignore-companions` overrides that.
+
+`check` diffs each C/C++ dependency's public headers between the pinned and the
+target tag and intersects the result with what we consume, so the
+breaking-change evidence does not depend on upstream having written good release
+notes. `apidiff` runs that alone, over more headers.
 """
 
 from __future__ import annotations
@@ -25,12 +31,94 @@ import sys
 from datetime import date
 
 from . import apply as apply_mod
-from . import backends, companion, discover, profile, upstream
+from . import apidiff, backends, companion, discover, profile, upstream
 from .fingerprint import compare
 from .model import Dep
 
 
 _COMPANION_MARK = {"bump": "+>", "unchanged": "==", "unresolved": "!?"}
+
+# Header diffing costs one fetch per header per ref, so it is worth doing only
+# where it can produce a finding: a pinned C/C++ dependency, behind, with a
+# readable GitHub upstream.
+_CXX_KINDS = ("cmake", "conan", "vcpkg", "pkg-config")
+
+
+def _worth_diffing(dep: Dep, info: dict) -> bool:
+    """Whether a header diff could produce a finding for this dependency.
+
+    Deliberately *not* conditioned on `dep.consumed`. It used to be, which meant
+    a dependency our extractor found no symbols for was skipped in silence and
+    reported exactly like one with nothing to worry about. Now the diff runs —
+    it can widen `consumed` from upstream's own declarations — and the one case
+    that still cannot produce a finding says so out loud.
+    """
+    return bool(
+        dep.upstream.kind == "github"
+        and info.get("resolved")
+        and info.get("behind_by")
+        and not info.get("unpinned")
+        and (dep.kind.startswith(_CXX_KINDS) or any(
+            "/" in s or s.endswith(".h") for s in apidiff.include_hints(dep)
+        ))
+    )
+
+
+def _api_lines(api: dict, indent: str = "   ") -> list[str]:
+    """Render a header diff. `!!` is a symbol we consume that has gone."""
+    out = []
+    if not api:
+        return out
+    if not api.get("resolved"):
+        if api.get("reason"):
+            out.append(f"{indent}api: {api['reason']}")
+        return out
+    head = (
+        f"{indent}api: {api['from_ref']} -> {api['to_ref']}, "
+        f"{api['headers_read']}/{api['headers_available']} public header(s)"
+    )
+    out.append(head)
+    for hit in api.get("affects_us") or []:
+        where = f" at {', '.join(hit['sites'][:3])}" if hit.get("sites") else ""
+        if hit["change"] == "removed":
+            mark = "!!" if hit.get("confirmed") else "!?"
+            out.append(f"{indent}  {mark} {hit['symbol']} — removed ({hit['kind']}){where}")
+        else:
+            out.append(f"{indent}  ~~ {hit['symbol']} — signature changed{where}")
+            # `before`/`after` hold only what differs, so one side is empty when
+            # an overload was purely added or purely dropped.
+            if hit["before"]:
+                out.append(f"{indent}     gone: {', '.join(hit['before'])}")
+            if hit["after"]:
+                out.append(f"{indent}     now:  {', '.join(hit['after'])}")
+    for ren in api.get("likely_renames") or []:
+        out.append(
+            f"{indent}  ?> {ren['from']} -> {ren['to']}? same signature, "
+            f"names {int(ren['similarity'] * 100)}% alike [inferred]"
+        )
+    if not api.get("affects_us"):
+        if api.get("consumed_count") == 0:
+            # An empty intersection with an empty input is a fact about our
+            # extractor, not about the upgrade.
+            out.append(
+                f"{indent}  ?? no consumed surface extracted, so none of the "
+                f"{len(api.get('removed') or [])} removal(s) upstream could be "
+                f"checked against our code — unmeasured, not unaffected"
+            )
+        else:
+            out.append(
+                f"{indent}  == nothing we consume was removed or re-signatured "
+                f"({len(api.get('removed') or [])} removal(s) upstream, none ours)"
+            )
+    # Never let an incomplete read read as a clean bill of health.
+    missing = api.get("not_located") or []
+    if missing:
+        out.append(
+            f"{indent}  ?? not declared in any header read: {', '.join(missing[:5])}"
+            + (f" (+{len(missing) - 5})" if len(missing) > 5 else "")
+            + " — unchecked, not unaffected"
+        )
+    return out
 
 
 def _companion_lines(companions: list[dict], indent: str = "  ") -> list[str]:
@@ -109,6 +197,7 @@ def cmd_profile(args) -> int:
         "deps": [
             {"name": d.name, "scope": d.scope, "version": d.version or d.installed_version,
              "consumed": len(d.consumed), "sites": len(d.sites),
+             "declarations": len(d.declarations), "divergence": d.divergence_note(),
              "assessed": bool(d.assessment)}
             for d in fresh
         ],
@@ -120,8 +209,11 @@ def cmd_profile(args) -> int:
         print(f"manifests: {', '.join(r['manifests']) or 'none'}")
         for d in r["deps"]:
             mark = "•" if d["assessed"] else "○"
+            extra = f"  {d['declarations']} declarations" if d["declarations"] > 1 else ""
             print(f"  {mark} {d['name']:<16} {d['scope']:<8} {d['version'] or '(unpinned)':<12} "
-                  f"{d['consumed']:>3} symbols  {d['sites']:>3} sites")
+                  f"{d['consumed']:>3} symbols  {d['sites']:>3} sites{extra}")
+            if d["divergence"]:
+                print(f"    != {d['divergence']}")
         if r["carried_over"]:
             print(f"preserved {r['carried_over']} existing assessment(s)")
         unassessed = [d["name"] for d in r["deps"] if not d["assessed"]]
@@ -216,11 +308,49 @@ def cmd_check(args) -> int:
                 dep, info["latest"], versions,
                 companion.notes_for(info["latest"], info.get("available")),
             )
+
+        # What changed upstream, in descending order of trustworthiness:
+        # the header diff is factual, a migration guide is upstream's own
+        # warning, and the commit log only stands in when there are no notes.
+        change: dict = {}
+        if not args.no_api_diff and _worth_diffing(dep, info):
+            versions = list(info.get("available") or [])
+            if info.get("current_tag"):
+                versions.append({"version": info["current"], "tag": info["current_tag"]})
+            if not dep.sites:
+                # Nothing of ours includes it, so widening the consumed surface
+                # from upstream's declarations has nothing to match against
+                # either. Stating that costs nothing; skipping in silence would
+                # look identical to a clean diff.
+                api = {"resolved": False, "reason": (
+                    "not diffed — no file of ours includes this dependency, so there "
+                    "is no consumed surface to intersect against (unmeasured, not "
+                    "unaffected)"
+                )}
+            else:
+                api = apidiff.surface_change(
+                    dep, info["current"], info["latest"], versions,
+                    max_headers=args.max_headers, root=root,
+                )
+            change["api_diff"] = api
+            if api.get("resolved"):
+                change.update(upstream.change_prose(
+                    dep.upstream.ref, api["from_ref"], api["to_ref"],
+                    companion.notes_for(info["latest"], info.get("available")),
+                    api["doc_candidates"],
+                ))
+
         findings.append({
             "name": dep.name,
             "kind": dep.kind,
             "scope": dep.scope,
             "declared_in": dep.declared_in,
+            "declarations": [d.render() for d in dep.declarations],
+            "aliases": dep.aliases,
+            # A consistency finding, not an upgrade one: it needs no upstream
+            # lookup, and for a project already current on everything it is
+            # usually the more valuable of the two.
+            "divergence": dep.divergence_note(),
             "pinned": dep.raw_pin,
             "integrity": dep.integrity,
             "installed_here": dep.installed_version,
@@ -234,6 +364,7 @@ def cmd_check(args) -> int:
             "companions": companions,
             "assessment": dep.assessment,
             "upstream": info,
+            "change_evidence": change,
             "advisories": vulns,
         })
 
@@ -244,6 +375,10 @@ def cmd_check(args) -> int:
     def human(r):
         for f in r["findings"]:
             up = f["upstream"]
+            # Independent of whether upstream resolved, so it is printed before
+            # the branches below bail out.
+            if f.get("divergence"):
+                print(f"!= {f['name']:<16} {f['divergence']}")
             if not up.get("resolved"):
                 print(f"?  {f['name']:<16} {up.get('reason','unresolved')}")
                 continue
@@ -258,13 +393,27 @@ def cmd_check(args) -> int:
             if up["behind_by"] == 0:
                 print(f"=  {f['name']:<16} {up['current'] or '(unpinned)'} — current")
                 continue
+            behind = f"{up['behind_by']}{'+' if up.get('behind_by_is_floor') else ''} behind"
             print(f"^  {f['name']:<16} {up['current'] or '?'} -> {up['latest']}  "
-                  f"({up['behind_by']} behind, {up['bump']}, scope={f['scope']})")
+                  f"({behind}, {up['bump']}, scope={f['scope']})")
+            if up.get("pin_unavailable"):
+                print(f"   !  {up['current']} is no longer offered by "
+                      f"{f['upstream'].get('source') or 'the index'} — a fresh "
+                      f"install cannot reproduce this build")
             if f["consumed"]:
                 print(f"   we call: {', '.join(f['consumed'][:8])}"
                       f"{' …' if len(f['consumed']) > 8 else ''}")
             for line in _companion_lines(f.get("companions") or [], indent="   "):
                 print(line)
+            for line in _api_lines((f.get("change_evidence") or {}).get("api_diff") or {}):
+                print(line)
+            for doc in (f.get("change_evidence") or {}).get("migration_docs") or []:
+                print(f"   doc: upstream ships {doc['path']} at the target version")
+            commits = (f.get("change_evidence") or {}).get("commits") or {}
+            if commits.get("resolved"):
+                print(f"   log: {commits['total']} commit(s), no release notes"
+                      + (f"; {len(commits['breaking'])} mention a break"
+                         if commits["breaking"] else ""))
             for v in f["advisories"]:
                 mark = "!!" if v.get("version_verified") else "?~"
                 fixed = f" fixed={v['fixed']}" if v.get("fixed") else ""
@@ -276,12 +425,57 @@ def cmd_check(args) -> int:
     return 0
 
 
+def cmd_apidiff(args) -> int:
+    """Diff one dependency's public headers between two versions."""
+    dep = _find_dep(args.root, args.dep)
+    if not dep.consumed:
+        # Without a consumed surface there is nothing to intersect against, and
+        # a bare list of upstream removals is what a changelog already is.
+        backends.analyse(args.root, [dep])
+
+    versions = upstream.fetch_versions(dep)
+    target = args.to
+    if not target:
+        ahead = upstream.newer_than(dep.version, versions)
+        if not ahead:
+            print(f"{dep.name} is at {dep.version or '(unpinned)'} — nothing newer to diff")
+            return 0
+        target = ahead[0]["version"]
+
+    result = apidiff.surface_change(
+        dep, args.from_version or dep.version, target, versions,
+        max_headers=args.max_headers, root=args.root,
+    )
+
+    def human(r):
+        if not r["resolved"]:
+            print(f"{dep.name}: {r['reason']}")
+            return
+        print(f"{dep.name} {r['from_version']} -> {r['to_version']} "
+              f"({r['repo']} {r['from_ref']}...{r['to_ref']})")
+        print(f"  {r['symbols_before']} public declaration(s) -> {r['symbols_after']}, "
+              f"read {r['headers_read']}/{r['headers_available']} header(s)")
+        for line in _api_lines(r, indent="  ")[1:]:
+            print(line)
+        for path in r["removed_headers"]:
+            print(f"  -- header gone: {path}")
+        for note in r["notes"]:
+            print(f"  ! {note}")
+
+    _emit(result, args.json, human)
+    return 0
+
+
 def _find_dep(root: str, name: str) -> Dep:
     deps, _ = profile.load(root)
     if not deps:
         deps, _ = discover.discover(root)
+    want = name.lower()
     for d in deps:
-        if d.name.lower() == name.lower():
+        # Aliases matter: after reconciliation `find_package(CURL)` and
+        # `libcurl/8.4.0` are one record under one of the two names, and the
+        # user may well type the other.
+        if want in [d.name.lower()] + [a.lower() for a in d.aliases]:
             return d
     raise SystemExit(f"no dependency named {name!r} in this repository")
 
@@ -438,7 +632,23 @@ def main(argv: list[str] | None = None) -> int:
     sp.add_argument("--pre", action="store_true", help="include pre-releases")
     sp.add_argument("--only", default="", help="comma-separated dependency names")
     sp.add_argument("--backend", default="", choices=["", *backends.NAMES])
+    sp.add_argument("--no-api-diff", action="store_true",
+                    help="skip the public-header diff (saves network, loses the "
+                         "only factual breaking-change evidence)")
+    sp.add_argument("--max-headers", type=int, default=apidiff.MAX_HEADERS,
+                    help=f"headers to read per dependency, per ref "
+                         f"(default: {apidiff.MAX_HEADERS})")
     sp.set_defaults(func=cmd_check)
+
+    sp = sub.add_parser("apidiff", parents=[common],
+                        help="diff a dependency's public headers between two versions")
+    sp.add_argument("--dep", required=True)
+    sp.add_argument("--to", default="", help="target version (default: latest)")
+    sp.add_argument("--from", dest="from_version", default="",
+                    help="baseline version (default: the pinned one)")
+    sp.add_argument("--max-headers", type=int, default=40,
+                    help="headers to read per ref (default: 40)")
+    sp.set_defaults(func=cmd_apidiff)
 
     companion_help = (
         "do not resolve or edit coupled pins, and do not refuse when one is "

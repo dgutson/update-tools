@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import urllib.error
@@ -135,7 +136,183 @@ def tag_forms(version: str, versions: list[dict] | None = None) -> list[str]:
     return out
 
 
+# ------------------------------------------------- what changed, without notes
+#
+# Release notes are the weakest evidence in this tool, and sometimes there are
+# none at all. `apidiff` answers "what changed" factually for C/C++ headers;
+# these two cover the rest of the gap for every ecosystem, in descending order
+# of trustworthiness: a migration guide is upstream telling you what will break,
+# and a commit log is at least a record of what was done.
+
+MIGRATION_DOCS = (
+    "MIGRATING.md", "MIGRATION.md", "MIGRATION_GUIDE.md", "UPGRADING.md",
+    "UPGRADE.md", "BREAKING_CHANGES.md", "BREAKING.md",
+    "docs/migration.md", "docs/upgrading.md", "doc/migration.md",
+)
+# Matched against a repo's own file listing, because the name is not
+# predictable: Symfony ships `UPGRADE-6.4.md`, so a fixed candidate list both
+# misses it and spends ten fetches proving that the guesses do not exist.
+_MIGRATION_DOC_RE = re.compile(
+    r"^(?:docs?/)?(?:upgrad|migrat|breaking)[\w.-]*\.(?:md|rst|txt|adoc)$",
+    re.I,
+)
+MAX_DOC_CHARS = 4000
+MAX_COMMITS = 40
+MAX_DOCS = 2
+
+
+_DOC_SERIES_RE = re.compile(r"(\d+)\.(\d+)")
+
+
+def migration_doc_paths(paths: list[str], version: str = "", since: str = "") -> list[str]:
+    """Migration-guide-looking files in a repo listing, most relevant first.
+
+    Projects that version these files keep every one of them — Symfony ships
+    `UPGRADE-6.0.md` through `UPGRADE-7.1.md` — so plain name order hands back
+    the oldest, describing a migration finished years ago. What is relevant is
+    every guide covering a step between the version in use and the target: a
+    dependency four releases behind has four migrations to make, not one.
+    Unversioned names (`MIGRATING.md`) are always kept.
+    """
+    hits = [p for p in paths if _MIGRATION_DOC_RE.match(p)]
+    lo, hi = parse_version(since), parse_version(version)
+    if not hi:
+        hits.sort(key=lambda p: (p.count("/"), len(p), p))
+        return hits
+
+    def rank(path: str):
+        m = _DOC_SERIES_RE.search(path.rsplit("/", 1)[-1])
+        if not m:
+            return (1, path.count("/"), len(path), path)  # unversioned: keep
+        series = (int(m.group(1)), int(m.group(2)))
+        if series > hi[:2] or (lo and series <= lo[:2]):
+            return (2, 0, 0, path)  # already done, or beyond where we are going
+        # Nearest the target first — that is the step most likely to bite.
+        return (0, hi[0] - series[0], hi[1] - series[1], path)
+
+    hits.sort(key=rank)
+    return [p for p in hits if rank(p)[0] != 2]
+
+# Conventional-commit and plain-English markers for a change that can break us.
+_BREAKING_RE = re.compile(
+    r"BREAKING[ _-]?CHANGE|^\w+(?:\([^)]*\))?!:|\b(?:remove[sd]?|renam(?:e|ed|ing)|"
+    r"delete[sd]?|drop(?:s|ped)?|deprecat\w*|replac\w*|incompatible)\b",
+    re.I | re.M,
+)
+
+
+def migration_docs(repo: str, ref: str, paths: list[str] | None = None) -> list[dict]:
+    """Upstream's own migration notes at a ref, when it keeps any.
+
+    Stronger evidence than a changelog: a project that writes one of these is
+    telling you what it expects to break, in the words of whoever broke it.
+
+    `paths` is the doc paths to try, in order, as produced by
+    `migration_doc_paths` from a listing the caller already has — the header
+    diff does — which turns this from ten speculative fetches into only fetching
+    files known to exist. The order is the caller's and is preserved: re-sorting
+    it here discarded the version ranking and fetched Symfony's `UPGRADE-6.0.md`
+    when the target was 6.4. Non-doc paths are dropped, so handing over a whole
+    repository listing is safe if wasteful.
+    """
+    if paths is None:
+        candidates = list(MIGRATION_DOCS)
+    else:
+        candidates = [p for p in paths if _MIGRATION_DOC_RE.match(p)]
+    out = []
+    for path in candidates:
+        text = fetch_file(repo, path, ref)
+        if not text.strip():
+            continue
+        out.append({"path": path, "text": text.strip()[:MAX_DOC_CHARS],
+                    "truncated": len(text.strip()) > MAX_DOC_CHARS})
+        if len(out) >= MAX_DOCS:
+            break
+    return out
+
+
+def compare_commits(repo: str, from_ref: str, to_ref: str) -> dict:
+    """Commit subjects between two tags — the fallback when notes are empty.
+
+    Subjects only. A full commit-message body is mostly noise and the payload is
+    going to a model with a finite context; what is wanted is the shape of the
+    release and, specifically, which commits announce a break.
+    """
+    data = _gh_api(f"repos/{repo}/compare/{from_ref}...{to_ref}")
+    if not isinstance(data, dict) or not isinstance(data.get("commits"), list):
+        return {"resolved": False, "reason": f"could not compare {from_ref}...{to_ref}"}
+
+    subjects, breaking = [], []
+    for c in data["commits"]:
+        if not isinstance(c, dict):
+            continue
+        message = ((c.get("commit") or {}).get("message") or "").strip()
+        if not message:
+            continue
+        subject = message.split("\n", 1)[0][:160]
+        subjects.append(subject)
+        # Match against the whole message: `BREAKING CHANGE:` lives in the body
+        # by convention, not in the subject.
+        if _BREAKING_RE.search(message):
+            breaking.append(subject)
+
+    total = data.get("total_commits")
+    return {
+        "resolved": True,
+        "total": total if isinstance(total, int) else len(subjects),
+        "shown": min(len(subjects), MAX_COMMITS),
+        "breaking": breaking[:MAX_COMMITS],
+        "subjects": subjects[:MAX_COMMITS],
+    }
+
+
+def change_prose(
+    repo: str,
+    from_ref: str,
+    to_ref: str,
+    notes: str = "",
+    doc_paths: list[str] | None = None,
+) -> dict:
+    """Non-header evidence for what changed, gathered only when it can help.
+
+    The commit log is a *fallback*: skipped when release notes already say
+    something, because a hundred commit subjects would then be noise competing
+    with a written summary. Migration guides are always worth a look — they are
+    better evidence than the notes, not a substitute for them.
+    """
+    out: dict = {"migration_docs": [], "commits": {}}
+    if not repo or "/" not in repo:
+        return out
+    if to_ref:
+        out["migration_docs"] = migration_docs(repo, to_ref, doc_paths)
+    if not notes.strip() and from_ref and to_ref:
+        out["commits"] = compare_commits(repo, from_ref, to_ref)
+        out["commits"]["why"] = "release notes for the target version were empty"
+    return out
+
+
 # ------------------------------------------------------------------ providers
+
+
+# A tag that carries the project name, e.g. `yaml-cpp-0.6.3`, `release-1.11.0`.
+_TAG_VERSION_RE = re.compile(r"(?:^|[-_/])v?(\d+(?:\.\d+)*(?:[-.]?[A-Za-z][\w.]*)?)$")
+
+
+def version_from_tag(tag: str) -> str:
+    """The version a tag names, with any project-name prefix removed.
+
+    `v1.2.3` is the common case and is handled by the strip alone. But plenty of
+    projects prefix the tag with their own name — yaml-cpp publishes
+    `yaml-cpp-0.6.3`, googletest published `release-1.11.0` — and those parse to
+    None, which silently removed every such release from consideration: no
+    version comparison, no upgrade found, and no readable ref for the header
+    diff or companion resolution to work from.
+    """
+    stripped = tag[1:] if tag[:1] in "vV" and tag[1:2].isdigit() else tag
+    if parse_version(stripped):
+        return stripped
+    m = _TAG_VERSION_RE.search(tag)
+    return m.group(1) if m else stripped
 
 
 def _github_versions(repo: str) -> list[dict]:
@@ -149,7 +326,7 @@ def _github_versions(repo: str) -> list[dict]:
             if not tag:
                 continue
             out.append({
-                "version": tag.lstrip("vV"),
+                "version": version_from_tag(tag),
                 "tag": tag,
                 "date": (r.get("published_at") or "")[:10],
                 "prerelease": bool(r.get("prerelease")),
@@ -163,9 +340,9 @@ def _github_versions(repo: str) -> list[dict]:
                 if not isinstance(t, dict):
                     continue
                 tag = t.get("name") or ""
-                if parse_version(tag):
+                if tag and parse_version(version_from_tag(tag)):
                     out.append({
-                        "version": tag.lstrip("vV"), "tag": tag, "date": "",
+                        "version": version_from_tag(tag), "tag": tag, "date": "",
                         "prerelease": False, "notes": "",
                         "url": f"https://github.com/{repo}/releases/tag/{tag}",
                     })
@@ -211,6 +388,41 @@ def _crates_versions(name: str) -> list[dict]:
          "notes": "", "url": f"https://crates.io/crates/{name}/{v.get('num','')}"}
         for v in (data.get("versions") or []) if not v.get("yanked")
     ]
+
+
+# Conan Center's recipe index is a GitHub repository, which this module already
+# knows how to read, and `recipes/<name>/config.yml` is the authoritative list of
+# what a project can actually pin — a version absent from it cannot be resolved
+# by the build no matter what upstream has released. One file per dependency, and
+# no API quota when raw.githubusercontent serves it.
+CONAN_INDEX_REPO = "conan-io/conan-center-index"
+# Version keys sit at exactly one level of indentation under `versions:`, and
+# carry no inline value; `folder: all` below them does.
+_CONAN_VERSION_KEY = re.compile(r'^  "?([^"\s:#][^"\s:]*)"?\s*:\s*$', re.M)
+
+
+def _conan_versions(name: str) -> list[dict]:
+    """Versions of a Conan recipe, newest-first ordering left to the caller.
+
+    `config.yml` records no dates, so `date` is empty — `summarise` already
+    tolerates that, and an unknown date is better than a guessed one.
+    """
+    text = fetch_file(CONAN_INDEX_REPO, f"recipes/{name}/config.yml", "master")
+    body = text.partition("versions:")[2] if text else ""
+    if not body:
+        return []
+    out = []
+    for m in _CONAN_VERSION_KEY.finditer(body):
+        ver = m.group(1)
+        if not parse_version(ver):
+            continue
+        out.append({
+            "version": ver, "tag": ver, "date": "",
+            "prerelease": bool(parse_version(ver) and parse_version(ver)[3] == 0),
+            "notes": "",
+            "url": f"https://conan.io/center/recipes/{name}?version={ver}",
+        })
+    return out
 
 
 def _repology_versions(name: str) -> list[dict]:
@@ -279,6 +491,8 @@ def fetch_versions(dep: Dep) -> list[dict]:
         return _npm_versions(ref)
     if kind == "crates":
         return _crates_versions(ref)
+    if kind == "conan":
+        return _conan_versions(ref)
     if kind == "distro":
         alias = DISTRO_ALIAS.get(ref, ref)
         versions = _repology_versions(alias)
@@ -311,6 +525,20 @@ def newer_than(current: str, versions: list[dict], allow_prerelease: bool = Fals
     return out
 
 
+# Sources whose catalogue is the *currently offered* set rather than a history.
+# Conan Center deletes old recipe versions — `zlib` lists exactly one — so a
+# count of what is newer is a floor on how far behind we are, not the number of
+# releases missed, and saying "1 version behind" without that caveat is the kind
+# of confidently wrong number this tool exists to avoid.
+_PRUNED_CATALOGUE = {"conan"}
+
+# Sources whose catalogue is authoritative about what can still be installed, so
+# a pin missing from it is a finding rather than a gap in our own data. Repology
+# is a survey of what distros happen to ship, and a GitHub release listing can be
+# paginated short, so neither qualifies.
+_AUTHORITATIVE = {"conan", "pypi", "npm", "crates"}
+
+
 def summarise(dep: Dep, allow_prerelease: bool = False) -> dict:
     """Everything the judgement layer needs about one dependency's upgrades."""
     current = dep.version or dep.installed_version
@@ -327,11 +555,19 @@ def summarise(dep: Dep, allow_prerelease: bool = False) -> dict:
     # The tag spelling for the version in use, so companion-pin resolution can
     # read the dependency's build files at exactly that ref instead of guessing.
     cur_parsed = parse_version(current)
-    current_tag = next(
-        (v.get("tag", "") for v in versions
-         if v.get("version") == current
-         or (cur_parsed and parse_version(v.get("version", "")) == cur_parsed)),
-        "",
+
+    def _is_current(v: dict) -> bool:
+        return bool(
+            v.get("version") == current
+            or (cur_parsed and parse_version(v.get("version", "")) == cur_parsed)
+        )
+
+    current_tag = next((v.get("tag", "") for v in versions if _is_current(v)), "")
+    pruned = dep.upstream.kind in _PRUNED_CATALOGUE
+    pin_missing = (
+        bool(current)
+        and dep.upstream.kind in _AUTHORITATIVE
+        and not any(_is_current(v) for v in versions)
     )
 
     if not current:
@@ -341,6 +577,7 @@ def summarise(dep: Dep, allow_prerelease: bool = False) -> dict:
         # plainly that the repo does not control this.
         return {
             "resolved": True,
+            "source": dep.upstream.kind,
             "unpinned": True,
             "current": "",
             "latest": latest,
@@ -353,11 +590,19 @@ def summarise(dep: Dep, allow_prerelease: bool = False) -> dict:
 
     return {
         "resolved": True,
+        "source": dep.upstream.kind,
         "unpinned": False,
         "current": current,
         "current_tag": current_tag,
         "latest": latest,
         "behind_by": len(ahead),
+        # `behind_by` counts entries in the catalogue, which for a pruned one is
+        # a lower bound rather than a release count.
+        "behind_by_is_floor": pruned,
+        # The pinned version is not offered any more: a fresh install cannot
+        # reproduce this build. A finding in its own right, independent of
+        # whether an upgrade is otherwise due.
+        "pin_unavailable": pin_missing,
         "bump": bump_kind(current, latest) if ahead else "same",
         # Cap the payload: the newest few carry the signal, and release notes
         # are long.

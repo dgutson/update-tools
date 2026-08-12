@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -119,6 +120,82 @@ class CompanionPin:
 
 
 @dataclass
+class Declaration:
+    """One place a dependency is declared, and what that place says.
+
+    A repository frequently declares the same dependency more than once: a
+    manifest per target platform, a `find_package` beside a package-manager
+    pin, a lockfile beside the manifest it was resolved from. Those
+    declarations can *disagree*, and the disagreement is a finding in its own
+    right — no upstream lookup produces it, and for a project already current
+    on everything it is worth more than "you are a minor version behind". So
+    each declaration is kept rather than folded into one version string.
+    """
+
+    path: str = ""  # relative to the repo root
+    line: int = 0  # 0 when the format records no position
+    kind: str = ""  # conan | cmake-find-package | npm | ...
+    version: str = ""  # "" when this declaration carries no version
+    raw_pin: str = ""  # verbatim, e.g. "openssl/3.0.15"
+
+    @property
+    def variant(self) -> str:
+        """The declaring directory — what tells one platform's manifest from
+        another's. Empty for a manifest at the repository root."""
+        return os.path.dirname(self.path)
+
+    def where(self) -> str:
+        return f"{self.path}:{self.line}" if self.line else self.path
+
+    def is_editable(self) -> bool:
+        """Can `apply` rewrite this pin? Needs a version *and* a position."""
+        return bool(self.version and self.path and self.line)
+
+    def render(self) -> str:
+        """One line, human-readable, round-trips through `parse`."""
+        out = self.version or "(unpinned)"
+        if self.raw_pin and self.raw_pin != self.version:
+            out += f" [{self.raw_pin}]"
+        if self.path:
+            out += f" — {self.where()}"
+        if self.kind:
+            out += f" ({self.kind})"
+        return out
+
+    @classmethod
+    def parse(cls, item: str) -> "Declaration | None":
+        """Recover a declaration from its rendered form in CLAUDE_DEPS.md."""
+        text = item.strip()
+        kind = ""
+        m = re.search(r"\s*\(([\w.\-+]+)\)$", text)
+        if m:
+            kind = m.group(1)
+            text = text[: m.start()]
+
+        head, _, where = text.partition(" — ")
+        path, line = "", 0
+        if where.strip():
+            fpart, _, lpart = where.strip().rpartition(":")
+            if fpart and lpart.isdigit():
+                path, line = fpart, int(lpart)
+            else:
+                path = where.strip()
+
+        head = head.strip()
+        raw = ""
+        rm = re.search(r"\s*\[(.+)\]$", head)
+        if rm:
+            raw = rm.group(1).strip()
+            head = head[: rm.start()].strip()
+        version = "" if head == "(unpinned)" else head
+        if not (path or version or raw):
+            return None
+        return cls(
+            path=path, line=line, kind=kind, version=version, raw_pin=raw or version
+        )
+
+
+@dataclass
 class Upstream:
     """Where to look for newer versions."""
 
@@ -137,7 +214,14 @@ class Dep:
     version: str = ""  # what we are pinned to, "" when unpinned
     raw_pin: str = ""  # URL / git tag / version spec, verbatim
     integrity: str = ""  # URL_HASH / sha / integrity field, verbatim
-    declared_in: str = ""  # "CMakeLists.txt:88"
+    declared_in: str = ""  # "CMakeLists.txt:88" — the site `apply` edits
+    # Every site this dependency is declared at, including `declared_in`.
+    # Filled in by reconciliation; a dependency declared once has one entry.
+    declarations: list[Declaration] = field(default_factory=list)
+    # Other names the same library is declared under — a CMake package name
+    # beside the package-manager one — so `--dep CURL` still resolves after
+    # `find_package(CURL)` and `libcurl/8.4.0` have been folded together.
+    aliases: list[str] = field(default_factory=list)
     scope: str = "runtime"
     scope_evidence: list[str] = field(default_factory=list)
     upstream: Upstream = field(default_factory=Upstream)
@@ -161,6 +245,32 @@ class Dep:
     def source_files(self) -> list[str]:
         return sorted({s.path for s in self.sites})
 
+    def pin_variants(self) -> dict[str, list[str]]:
+        """version -> the sites asserting it, for declarations carrying one.
+
+        A declaration with no version (`find_package(CURL)`) is not evidence of
+        disagreement, so it does not appear here.
+        """
+        out: dict[str, list[str]] = {}
+        for d in self.declarations:
+            if d.version:
+                out.setdefault(d.version, []).append(d.where())
+        return {v: sorted(set(w)) for v, w in sorted(out.items())}
+
+    def diverges(self) -> bool:
+        """True when two declarations of this dependency pin different versions."""
+        return len(self.pin_variants()) > 1
+
+    def divergence_note(self) -> str:
+        """The finding, phrased for a human. Empty when there is nothing to say."""
+        if not self.diverges():
+            return ""
+        parts = [f"{v} in {', '.join(w)}" for v, w in self.pin_variants().items()]
+        return (
+            "declarations disagree on the version — " + "; ".join(parts)
+            + " — so what ships depends on which manifest the build used"
+        )
+
     def fingerprint(self, root: str) -> dict[str, str]:
         """Hashes that let /deps:sync detect drift without any LLM call."""
         from .fingerprint import hash_declaration, hash_files, hash_text
@@ -180,6 +290,12 @@ class Dep:
         d = dict(d)
         d["upstream"] = Upstream(**d.get("upstream", {}) or {})
         d["sites"] = [Site(**s) for s in d.get("sites", []) or []]
+        decls = []
+        for c in d.get("declarations", []) or []:
+            decl = Declaration(**c) if isinstance(c, dict) else Declaration.parse(str(c))
+            if decl:
+                decls.append(decl)
+        d["declarations"] = decls
         # Tolerate the pre-structured form: a profile written by an older
         # version records companion pins as plain rendered strings.
         pins = []

@@ -169,14 +169,28 @@ def iter_commands(text: str, rel_file: str) -> list[Command]:
     return cmds
 
 
-def collect_cmake_files(root: str, entry: str = "CMakeLists.txt") -> list[str]:
-    """Follow include() / add_subdirectory() from the entry point."""
+def _under(rel: str, dirs: set[str]) -> bool:
+    norm = os.path.normpath(rel)
+    return any(norm == d or norm.startswith(d + os.sep) for d in dirs)
+
+
+def collect_cmake_files(
+    root: str, entry: str = "CMakeLists.txt", skip: set[str] | None = None
+) -> list[str]:
+    """Follow include() / add_subdirectory() from the entry point.
+
+    `skip` is a set of directories, relative to root, holding other projects'
+    checkouts. A vendored tree is usually reached by `add_subdirectory`, so
+    excluding it from the manifest walk alone is not enough: its internal
+    `find_package` calls would still be read as our dependencies.
+    """
+    skip = skip or set()
     seen: list[str] = []
     queue = [entry]
     guard = set()
     while queue:
         rel = queue.pop(0)
-        if rel in guard:
+        if rel in guard or _under(rel, skip):
             continue
         guard.add(rel)
         full = os.path.join(root, rel)
@@ -419,9 +433,11 @@ def _merge(a: Dep, b: Dep) -> Dep:
     return keep
 
 
-def parse_project(root: str, entry: str = "CMakeLists.txt") -> tuple[list[Dep], list[str]]:
+def parse_project(
+    root: str, entry: str = "CMakeLists.txt", skip: set[str] | None = None
+) -> tuple[list[Dep], list[str]]:
     """Return (deps, cmake_files_read)."""
-    files = collect_cmake_files(root, entry)
+    files = collect_cmake_files(root, entry, skip)
     deps: dict[str, Dep] = {}
     # name -> scope, learned from FetchContent_MakeAvailable / link edges
     scope_hint: dict[str, str] = {}

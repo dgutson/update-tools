@@ -66,6 +66,15 @@ def plan(root: str, dep: Dep, new_version: str, companions: list[dict] | None = 
     """
     if not dep.declared_in:
         raise ApplyError(f"{dep.name}: no declaration site recorded")
+    if dep.diverges():
+        # Editing one site would deepen the disagreement rather than resolve it,
+        # and "bump to X" does not say which of the current versions it is
+        # bumping from. Same rule as an unresolved companion pin: stopping beats
+        # guessing.
+        raise ApplyError(
+            f"{dep.name}: {dep.divergence_note()}. Reconcile the declarations "
+            f"first — a bump from one of them alone would leave the others behind."
+        )
     rel = dep.declared_in.split(":")[0]
     full = os.path.join(root, rel)
     if not os.path.isfile(full):
@@ -125,6 +134,33 @@ def plan(root: str, dep: Dep, new_version: str, companions: list[dict] | None = 
     companion_edits: list[dict] = []
     blocked_on: list[str] = []
 
+    # The same version pinned in several manifests — one per target platform —
+    # has to move in all of them or the bump silently creates the divergence
+    # that `Dep.diverges()` exists to report. `diverges()` was checked above, so
+    # every sibling here agrees with `old_version`.
+    also_pinned_in: list[str] = []
+    for sib in dep.declarations:
+        if not sib.is_editable() or sib.where() == dep.declared_in:
+            continue
+        sfull = os.path.join(root, sib.path)
+        if not os.path.isfile(sfull):
+            blocked_on.append(f"{sib.where()} (also pins {sib.version}, but the file is missing)")
+            continue
+        if sib.path not in files:
+            stext = open(sfull, encoding="utf-8", errors="replace").read()
+            files[sib.path] = (stext, stext)
+        original, current = files[sib.path]
+        slo, shi = _declaration_span(current, sib.line) if sib.line else (0, len(current))
+        sblock = current[slo:shi]
+        new_sblock = _swap_version(sblock, sib.version, new_version)
+        if new_sblock == sblock:
+            blocked_on.append(
+                f"{sib.where()} (also pins {sib.version}, but it was not found there)"
+            )
+            continue
+        files[sib.path] = (original, current[:slo] + new_sblock + current[shi:])
+        also_pinned_in.append(sib.where())
+
     for c in companions or []:
         if c.get("action") != "bump":
             if c.get("action") == "unresolved":
@@ -180,6 +216,8 @@ def plan(root: str, dep: Dep, new_version: str, companions: list[dict] | None = 
         "companion_pins": [p.render() for p in dep.companion_pins],
         "companions": list(companions or []),
         "companion_edits": companion_edits,
+        # Further manifests pinning the same version, bumped in the same plan.
+        "also_pinned_in": also_pinned_in,
         "blocked_on": blocked_on,
         "edits": edits,
         "diff": "".join(e["diff"] for e in edits),

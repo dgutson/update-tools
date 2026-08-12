@@ -17,7 +17,7 @@ import os
 import re
 from datetime import date
 
-from .model import CompanionPin, Dep, Site, Upstream
+from .model import CompanionPin, Declaration, Dep, Site, Upstream
 
 FILENAME = "CLAUDE_DEPS.md"
 
@@ -60,6 +60,12 @@ def render(deps: list[Dep], root: str, meta: dict) -> str:
         lines.append(f"- kind: {dep.kind}")
         pin = dep.raw_pin or dep.version or "(unpinned)"
         lines.append(f"- pinned: {pin}" + (f" — {dep.declared_in}" if dep.declared_in else ""))
+        # Only worth spelling out when there is more than one; a single
+        # declaration is already the `- pinned:` line.
+        if len(dep.declarations) > 1:
+            lines += _fmt_list("declarations", [d.render() for d in dep.declarations])
+        if dep.aliases:
+            lines.append(f"- aliases: {', '.join(dep.aliases)}")
         if dep.version:
             lines.append(f"- version: {dep.version}")
         if dep.installed_version:
@@ -171,6 +177,8 @@ def _assign(dep: Dep, key: str, val: str) -> None:
             pass
     elif key == "backend":
         dep.backend = val
+    elif key == "aliases":
+        dep.aliases = [s.strip() for s in val.split(",") if s.strip()]
     elif key == "fingerprint":
         dep.stored_fingerprint = dict(
             re.findall(r"(\w+)=(\w+)", val)
@@ -186,6 +194,10 @@ def _append(dep: Dep, key: str, item: str) -> None:
             dep.sites.append(
                 Site(path=m.group(1), line=int(m.group(2)), symbol=(m.group(3) or "").strip())
             )
+    elif key == "declarations":
+        decl = Declaration.parse(item)
+        if decl:
+            dep.declarations.append(decl)
     elif key == "companion-pins":
         pin = CompanionPin.parse(item)
         if pin:

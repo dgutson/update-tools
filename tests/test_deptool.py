@@ -19,6 +19,7 @@ from deptool.apply import plan as apply_plan
 from deptool.fingerprint import hash_declaration, hash_files, hash_text
 from deptool.model import (
     CompanionPin,
+    Declaration,
     Dep,
     Site,
     Upstream,
@@ -1029,3 +1030,1342 @@ def test_write_and_revert_cover_a_companion_in_another_file(tmp_path):
     assert "0.29.0" in (tmp_path / "cmake" / "pins.cmake").read_text()
     assert "v0.7.4" in (tmp_path / "CMakeLists.txt").read_text()
     assert not list(tmp_path.rglob("*.deptool.bak"))
+
+
+# ------------------------------------------------------- public-header diffing
+#
+# The header diff exists so that "what changed upstream" stops depending on
+# whether upstream wrote good release notes. Its dangerous failure is not
+# missing a break — it is *inventing* one, or reporting a clean bill of health
+# it never established, because either makes the report untrustworthy.
+
+
+HEADER_OLD = """\
+#ifndef SYNTH_H
+#define SYNTH_H
+/* class Ghost { */
+// int commented_out(void);
+typedef struct _fluid_synth_t fluid_synth_t;
+
+int fluid_synth_noteon(fluid_synth_t* synth,
+                       int chan, int key, int vel);
+int fluid_synth_cc(fluid_synth_t* synth, int chan, int num, int val);
+void fluid_synth_gone(fluid_synth_t* synth);
+
+namespace hegel {
+class TestCase {
+ public:
+  virtual void run() = 0;
+  std::string name() const;
+};
+namespace generators {
+int uniform(int lo, int hi);
+}
+using Seed = unsigned long;
+}
+#endif
+"""
+
+HEADER_NEW = """\
+#ifndef FLUID_SYNTH_H_INCLUDED
+#define FLUID_SYNTH_H_INCLUDED
+typedef struct _fluid_synth_t fluid_synth_t;
+
+int fluid_synth_noteon(fluid_synth_t* synth,
+                       int chan, int key, int vel, int flags);
+int fluid_synth_cc(fluid_synth_t* synth, int channel, int number, int value);
+void fluid_synth_release(fluid_synth_t* synth);
+
+namespace hegel {
+class TestCase {
+ public:
+  virtual void run() override;
+  std::string name() const;
+};
+namespace generators {
+int uniform(int lo, int hi);
+}
+using Seed = unsigned long;
+}
+#endif
+"""
+
+
+def test_declarations_reads_real_header_shapes():
+    """Multi-line params, namespaces, pure virtuals, aliases, comments."""
+    from deptool.apidiff import declarations
+
+    got = declarations(HEADER_OLD, "synth.h")
+    assert "fluid_synth_noteon" in got  # parameter list spans two lines
+    assert "hegel::TestCase" in got
+    assert "hegel::TestCase::run" in got  # qualified by namespace *and* class
+    assert "hegel::generators::uniform" in got
+    assert "hegel::Seed" in got
+    assert got["fluid_synth_t"][0].kind == "alias"
+    # A commented-out declaration is not API, and neither is prose in a comment.
+    assert "commented_out" not in got
+    assert "Ghost" not in got
+
+
+def test_include_guard_is_not_api():
+    """Renaming a guard must not read as removing a macro.
+
+    Guards are renamed freely. `#ifndef X` + a bare `#define X` is a guard;
+    `#ifndef X` + `#define X 1` is a configuration knob, which is real API.
+    """
+    from deptool.apidiff import declarations, diff
+
+    assert "SYNTH_H" not in declarations(HEADER_OLD)
+    assert "FLUID_SYNTH_H_INCLUDED" not in declarations(HEADER_NEW)
+    # The guard is renamed between these two headers; that must produce no
+    # finding of any kind, while the genuine removal beside it still does.
+    result = diff(declarations(HEADER_OLD), declarations(HEADER_NEW))
+    assert [d.name for d in result["removed"]] == ["fluid_synth_gone"]
+    assert not any(d.kind == "macro" for d in result["added"])
+
+    knob = "#ifndef FLUID_BUFSIZE\n#define FLUID_BUFSIZE 64\n#endif\n"
+    assert "FLUID_BUFSIZE" in declarations(knob)
+
+
+def test_renaming_a_parameter_is_not_a_breaking_change():
+    """`f(int chan)` -> `f(int channel)` changes nothing for a caller.
+
+    Reporting it would bury the real findings under noise, since upstream tidies
+    parameter names constantly.
+    """
+    from deptool.apidiff import declarations, diff
+
+    result = diff(declarations(HEADER_OLD), declarations(HEADER_NEW))
+    changed = {c["qualified"] for c in result["changed"]}
+    assert "fluid_synth_cc" not in changed  # only the parameter names moved
+    assert "fluid_synth_noteon" in changed  # a parameter was actually added
+
+
+def test_added_override_is_not_a_signature_change():
+    """`override` is a note to the compiler, not part of the callable's type.
+
+    Observed on yaml-cpp 0.6.3 -> 0.8.0, where annotating the existing virtuals
+    accounted for every single "re-signatured" finding.
+    """
+    from deptool.apidiff import declarations, diff
+
+    result = diff(declarations(HEADER_OLD), declarations(HEADER_NEW))
+    assert "hegel::TestCase::run" not in {c["qualified"] for c in result["changed"]}
+
+
+def test_restrict_annotation_is_not_part_of_the_type():
+    """Observed on FluidSynth: adding FLUID_RESTRICT read as a signature change."""
+    from deptool.apidiff import declarations, diff
+
+    before = declarations("int f(const short int *a, unsigned int n);")
+    after = declarations("int f(const short int * FLUID_RESTRICT a, unsigned int n);")
+    assert diff(before, after)["changed"] == []
+
+
+def test_declaration_moved_to_another_header_is_not_a_removal():
+    """Upstream reorganising its headers is routine and breaks nobody.
+
+    The rule is that a removal must be absent from *every* header read at the
+    target, not merely from the one it used to live in.
+    """
+    from deptool.apidiff import declarations, diff
+
+    before = declarations("void fluid_synth_gone(int a);\n", "a.h")
+    after = declarations("void fluid_synth_gone(int a);\n", "b.h")
+    assert diff(before, after)["removed"] == []
+
+
+def test_likely_rename_is_labelled_inference():
+    """A rename cannot be proved from two snapshots, so it must not be asserted."""
+    from deptool.apidiff import declarations, diff, likely_renames
+
+    before = declarations("void new_fluid_sdl2_audio_driver(int a);")
+    after = declarations("void new_fluid_sdl3_audio_driver(int a);")
+    result = diff(before, after)
+    guesses = likely_renames(result["removed"], result["added"])
+    assert len(guesses) == 1
+    assert guesses[0]["from"] == "new_fluid_sdl2_audio_driver"
+    assert guesses[0]["to"] == "new_fluid_sdl3_audio_driver"
+    assert guesses[0]["confidence"] == "inferred"
+
+
+# ------------------------------------------------------------- header selection
+
+
+def test_public_headers_prefers_a_declared_public_surface():
+    """A project with include/ has already said what its API is.
+
+    Observed on FluidSynth: taking every non-private header found 66 of them and
+    turned internal churn into 33 "removals" no consumer could have called. Its
+    real surface is the 15 under include/.
+    """
+    from deptool.apidiff import public_headers
+
+    tree = [
+        "include/fluidsynth.h", "include/fluidsynth/synth.h",
+        "src/fluid_synth.h", "src/drivers/fluid_adriver.h",
+        "test/fluid_test.h", "doc/x.h", "README.md",
+    ]
+    assert public_headers(tree) == ["include/fluidsynth.h", "include/fluidsynth/synth.h"]
+
+
+def test_public_headers_falls_back_when_there_is_no_public_root():
+    """Plenty of libraries keep their headers beside the sources."""
+    from deptool.apidiff import public_headers
+
+    tree = ["single.h", "src/lib.hpp", "tests/helper.h", "vendor/dep.h"]
+    assert public_headers(tree) == ["single.h", "src/lib.hpp"]
+
+
+def test_headers_naming_a_consumed_subsystem_are_read_first():
+    """The budget is smaller than some libraries, so order decides coverage.
+
+    Observed: `fluid_ramsfont_t` is declared in `ramsfont.h`, which sorted
+    outside a 12-header budget, so a real removal of a type this project uses was
+    reported as "nothing we consume was removed".
+    """
+    from deptool.apidiff import public_headers, symbol_stems
+
+    tree = [f"include/fs/{n}.h" for n in
+            ("audio", "event", "log", "midi", "mod", "ramsfont", "seq", "synth")]
+    stems = symbol_stems(["fluid_ramsfont_t", "fluid_synth_noteon"])
+    ranked = public_headers(tree, (), stems)
+    assert set(ranked[:2]) == {"include/fs/ramsfont.h", "include/fs/synth.h"}
+
+
+# --------------------------------------------------------------- intersection
+
+
+def _fake_headers(files, tree_paths):
+    def tree(repo, ref):
+        return tree_paths if ref in {r for r, _ in files} else []
+
+    def fetch(repo, path, ref):
+        return files.get((ref, path), "")
+
+    return fetch, tree
+
+
+def _fs_dep(**kw):
+    kw.setdefault("consumed", ["fluid_synth_noteon", "fluid_synth_gone"])
+    kw.setdefault("sites", [
+        Site("src/a.cpp", 3, "#include <fs/synth.h>"),
+        Site("src/a.cpp", 41, "fluid_synth_gone"),
+    ])
+    return Dep(name="fluidsynth", kind="pkg-config", version="2.3.4",
+               upstream=Upstream(kind="github", ref="FluidSynth/fluidsynth"), **kw)
+
+
+def test_surface_change_intersects_removals_with_our_call_sites():
+    """The whole point: a removal we consume, pointing at our own file:line."""
+    from deptool import apidiff
+
+    files = {
+        ("v2.3.4", "include/fs/synth.h"):
+            "int fluid_synth_noteon(int a);\nvoid fluid_synth_gone(int a);\n",
+        ("v2.5.7", "include/fs/synth.h"): "int fluid_synth_noteon(int a);\n",
+    }
+    fetch, tree = _fake_headers(files, ["include/fs/synth.h"])
+    got = apidiff.surface_change(_fs_dep(), "2.3.4", "2.5.7", fetch=fetch, tree=tree)
+
+    assert got["resolved"] is True
+    assert [h["symbol"] for h in got["affects_us"]] == ["fluid_synth_gone"]
+    hit = got["affects_us"][0]
+    assert hit["change"] == "removed"
+    assert hit["sites"] == ["src/a.cpp:41"]
+    # Every public header was read, so absence at the target is established.
+    assert hit["confirmed"] is True
+
+
+def test_a_symbol_outside_the_budget_is_hunted_before_being_called_removed():
+    """A truncated read must not manufacture a removal.
+
+    The symbol moved to a header the budget skipped. Reporting it as removed
+    would send someone to rewrite a working call site.
+    """
+    from deptool import apidiff
+
+    files = {
+        ("v2.3.4", "include/fs/synth.h"):
+            "int fluid_synth_noteon(int a);\nvoid fluid_synth_gone(int a);\n",
+        ("v2.5.7", "include/fs/synth.h"): "int fluid_synth_noteon(int a);\n",
+        ("v2.3.4", "include/fs/zz.h"): "",
+        ("v2.5.7", "include/fs/zz.h"): "void fluid_synth_gone(int a);\n",
+    }
+    tree_paths = ["include/fs/synth.h", "include/fs/zz.h"]
+    fetch, tree = _fake_headers(files, tree_paths)
+    got = apidiff.surface_change(
+        _fs_dep(), "2.3.4", "2.5.7", fetch=fetch, tree=tree, max_headers=1
+    )
+
+    assert got["truncated"] is True
+    assert got["affects_us"] == []
+    # And the disproved removal is gone from the raw list too, or the summary
+    # counts would keep reporting it.
+    assert [d["name"] for d in got["removed"]] == []
+    assert any("moved, not dropped" in n for n in got["notes"])
+
+
+def test_a_genuine_removal_survives_the_confirmation_pass():
+    from deptool import apidiff
+
+    files = {
+        ("v2.3.4", "include/fs/synth.h"):
+            "int fluid_synth_noteon(int a);\nvoid fluid_synth_gone(int a);\n",
+        ("v2.5.7", "include/fs/synth.h"): "int fluid_synth_noteon(int a);\n",
+        ("v2.3.4", "include/fs/zz.h"): "int unrelated(void);\n",
+        ("v2.5.7", "include/fs/zz.h"): "int unrelated(void);\n",
+    }
+    fetch, tree = _fake_headers(files, ["include/fs/synth.h", "include/fs/zz.h"])
+    got = apidiff.surface_change(
+        _fs_dep(), "2.3.4", "2.5.7", fetch=fetch, tree=tree, max_headers=1
+    )
+    assert [h["symbol"] for h in got["affects_us"]] == ["fluid_synth_gone"]
+    assert got["affects_us"][0]["confirmed"] is True
+
+
+def test_unread_headers_never_become_a_clean_bill_of_health():
+    """A symbol we consume that no header we read declares is *unchecked*.
+
+    Folding it into the unaffected majority is how a truncated read turns into
+    "nothing we consume was removed" — the exact wrong answer.
+    """
+    from deptool import apidiff
+
+    files = {
+        ("v2.3.4", "include/fs/synth.h"): "int fluid_synth_noteon(int a);\n",
+        ("v2.5.7", "include/fs/synth.h"): "int fluid_synth_noteon(int a);\n",
+        ("v2.3.4", "include/fs/zz.h"): "void fluid_synth_gone(int a);\n",
+    }
+    fetch, tree = _fake_headers(files, ["include/fs/synth.h", "include/fs/zz.h"])
+    got = apidiff.surface_change(
+        _fs_dep(), "2.3.4", "2.5.7", fetch=fetch, tree=tree, max_headers=1
+    )
+    assert got["not_located"] == ["fluid_synth_gone"]
+    assert any("says nothing about them" in n for n in got["notes"])
+
+
+def test_unreadable_upstream_is_reported_not_silently_passed():
+    """No headers read must never look like no changes found."""
+    from deptool import apidiff
+
+    pypi = Dep(name="requests", kind="pypi", version="2.0",
+               upstream=Upstream(kind="pypi", ref="requests"), consumed=["get"])
+    got = apidiff.surface_change(pypi, "2.0", "2.31.0")
+    assert got["resolved"] is False
+    assert "no readable upstream repository" in got["reason"]
+    assert got["affects_us"] == []
+
+    fetch, tree = _fake_headers({}, [])
+    missing = apidiff.surface_change(_fs_dep(), "2.3.4", "9.9.9", fetch=fetch, tree=tree)
+    assert missing["resolved"] is False
+    assert "could not list" in missing["reason"]
+
+
+# ---------------------------------------------------- versions and prose
+
+@pytest.mark.parametrize(
+    "tag,version",
+    [
+        ("v1.2.3", "1.2.3"),
+        ("1.2.3", "1.2.3"),
+        ("yaml-cpp-0.6.3", "0.6.3"),   # jbeder/yaml-cpp
+        ("release-1.11.0", "1.11.0"),  # google/googletest
+        ("20230125.3", "20230125.3"),  # abseil
+        ("v1.0.0-rc1", "1.0.0-rc1"),
+    ],
+)
+def test_version_from_tag_survives_a_project_name_prefix(tag, version):
+    """A prefixed tag used to parse to None, deleting the release entirely.
+
+    Every such release vanished from `newer_than`, so yaml-cpp reported nothing
+    to upgrade to, and neither companion resolution nor the header diff could
+    find a ref to read.
+    """
+    from deptool.upstream import version_from_tag
+
+    assert version_from_tag(tag) == version
+    assert parse_version(version_from_tag(tag)) is not None
+
+
+def test_migration_docs_cover_the_steps_between_the_two_versions():
+    """Symfony keeps every UPGRADE-*.md, including migrations long since done."""
+    from deptool.upstream import migration_doc_paths
+
+    tree = ["README.md"] + [f"UPGRADE-6.{n}.md" for n in range(5)] + [
+        "UPGRADE-7.0.md", "MIGRATING.md", "src/upgrade.cpp",
+    ]
+    assert migration_doc_paths(tree, "6.4.0", "6.3.0")[0] == "UPGRADE-6.4.md"
+    ranged = migration_doc_paths(tree, "6.4.0", "6.1.0")
+    assert ranged[:3] == ["UPGRADE-6.4.md", "UPGRADE-6.3.md", "UPGRADE-6.2.md"]
+    assert "UPGRADE-6.1.md" not in ranged  # already done
+    assert "UPGRADE-7.0.md" not in ranged  # beyond the target
+    assert "MIGRATING.md" in ranged  # unversioned, always relevant
+    assert "src/upgrade.cpp" not in ranged
+
+
+def test_commit_log_only_stands_in_when_there_are_no_release_notes(monkeypatch):
+    """A hundred commit subjects beside a written summary is noise, not evidence."""
+    from deptool import upstream
+
+    calls = []
+    monkeypatch.setattr(upstream, "fetch_file", lambda *a: "")
+    monkeypatch.setattr(upstream, "compare_commits",
+                        lambda *a: calls.append(a) or {"resolved": True})
+
+    upstream.change_prose("o/r", "v1", "v2", notes="Real notes", doc_paths=[])
+    assert calls == []
+    upstream.change_prose("o/r", "v1", "v2", notes="   ", doc_paths=[])
+    assert len(calls) == 1
+
+
+def test_compare_commits_flags_the_subjects_that_announce_a_break(monkeypatch):
+    """`BREAKING CHANGE:` lives in the body by convention, not the subject."""
+    from deptool import upstream
+
+    monkeypatch.setattr(upstream, "_gh_api", lambda path: {
+        "total_commits": 3,
+        "commits": [
+            {"commit": {"message": "Fix rounding\n\nnothing to see"}},
+            {"commit": {"message": "Tidy up\n\nBREAKING CHANGE: drops fluid_foo"}},
+            {"commit": {"message": "Deprecate LASH support"}},
+        ],
+    })
+    got = upstream.compare_commits("o/r", "v1", "v2")
+    assert got["total"] == 3
+    assert got["breaking"] == ["Tidy up", "Deprecate LASH support"]
+    assert "Fix rounding" in got["subjects"]
+
+
+# ------------------------------------------------------- the consumed surface
+#
+# The API-surface diff can only report a break in a symbol the extractor
+# recorded, so a miss here is a break that is never reported. These cover the
+# categories that used to be missed wholesale, and the guardrails that keep a
+# thin harvest from reading as a clean bill of health.
+
+
+def _write(tmp_path, rel, text):
+    p = tmp_path / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(textwrap.dedent(text))
+    return p
+
+
+FLUID_TU = """\
+    #include <fluidsynth.h>
+
+    static fluid_synth_t *g_synth = nullptr;
+    static fluid_ramsfont_t *g_ram = nullptr;
+
+    void init() {
+        fluid_settings_t *s = new_fluid_settings();
+        g_synth = new_fluid_synth(s);
+        if (fluid_synth_sfload(g_synth, "x.sf2", 1) == FLUID_FAILED) {
+            return;
+        }
+        fluid_synth_noteon(g_synth, 0, 60, 100);
+        delete_fluid_synth(g_synth);
+    }
+"""
+
+
+def test_non_function_api_is_harvested(tmp_path):
+    """Types and constants are API too, and are how C libraries break you.
+
+    The harvest required a `(` after the symbol, which restricted it to
+    functions. FluidSynth's `fluid_ramsfont_t` — the removal this tool's own
+    README leads with — is a type, so it could never have been recorded, and the
+    header diff had nothing on our side to match the removal against.
+    """
+    from deptool.backends import builtin
+
+    _write(tmp_path, "src/audio.cpp", FLUID_TU)
+    dep = Dep(name="fluidsynth", kind="pkg-config")
+    builtin.analyse(str(tmp_path), [dep])
+
+    assert "fluid_ramsfont_t" in dep.consumed   # type, never followed by `(`
+    assert "fluid_synth_t" in dep.consumed
+    assert "FLUID_FAILED" in dep.consumed       # enum constant
+    assert "fluid_synth_noteon" in dep.consumed  # still finds the calls
+
+
+def test_constructor_affixes_do_not_hide_a_symbol(tmp_path):
+    """`new_fluid_synth` is a plain call that does not start with `fluid_`.
+
+    Matching on the library's prefix alone missed the whole constructor and
+    destructor surface of any C library that names them this way.
+    """
+    from deptool.backends import builtin
+
+    _write(tmp_path, "src/audio.cpp", FLUID_TU)
+    dep = Dep(name="fluidsynth", kind="pkg-config")
+    builtin.analyse(str(tmp_path), [dep])
+
+    assert {"new_fluid_settings", "new_fluid_synth", "delete_fluid_synth"} <= set(dep.consumed)
+
+
+def test_use_sites_record_what_the_use_looked_like(tmp_path):
+    """A call, a type mention and a constant are not equally strong evidence."""
+    from deptool.backends import builtin
+
+    _write(tmp_path, "src/audio.cpp", FLUID_TU)
+    dep = Dep(name="fluidsynth", kind="pkg-config")
+    builtin.analyse(str(tmp_path), [dep])
+
+    ctx = {s.symbol: s.context for s in dep.sites}
+    assert ctx["fluid_synth_noteon"] == "call"
+    assert ctx["fluid_synth_t"] == "type"
+    assert ctx["FLUID_FAILED"] == "constant"
+
+
+def test_comments_and_literals_are_not_uses(tmp_path):
+    """Dropping the `(` requirement would otherwise harvest prose.
+
+    A symbol named in a log message or a doc comment is not a call, and an
+    include path is not a symbol at all.
+    """
+    from deptool.backends import builtin
+
+    _write(tmp_path, "src/audio.cpp", """\
+        #include <fluidsynth/fluid_deprecated.h>
+        // TODO: stop using fluid_old_thing
+        /* fluid_block_comment_thing */
+        void log_it() {
+            report("fluid_string_thing failed");
+            fluid_real_call(1);
+        }
+    """)
+    dep = Dep(name="fluidsynth", kind="pkg-config")
+    builtin.analyse(str(tmp_path), [dep])
+
+    assert dep.consumed == ["fluid_real_call"]
+
+
+def test_a_bare_stem_prefix_still_has_to_look_like_a_call(tmp_path):
+    """zlib's prefixes are function names, not namespace markers.
+
+    `compress` and `deflate` are ordinary English words; treating them the way
+    `fluid_` is treated would attribute any identifier containing them.
+    """
+    from deptool.backends import builtin
+
+    _write(tmp_path, "src/z.c", """\
+        #include <zlib.h>
+        int go(int compress_level, int deflate_mode) {
+            return compress2(0, 0, 0, 0, compress_level) + deflate_mode;
+        }
+    """)
+    dep = Dep(name="zlib", kind="pkg-config")
+    builtin.analyse(str(tmp_path), [dep])
+
+    assert dep.consumed == ["compress2"]
+
+
+def test_an_attributed_dep_with_no_symbols_says_so(tmp_path):
+    """The prefix guess fails outright for a library named unlike its API.
+
+    libsndfile's package name yields `sndfile_`; its API is `sf_open`. Nothing
+    matches, and an empty `consumed` makes every upgrade look harmless — so the
+    gap has to be stated where the profile can show it.
+    """
+    from deptool.backends import builtin
+
+    _write(tmp_path, "src/snd.c", """\
+        #include <sndfile.h>
+        void go(void) { SNDFILE *f = sf_open("a.wav", 0x10, 0); sf_close(f); }
+    """)
+    dep = Dep(name="libsndfile", kind="pkg-config")
+    builtin.analyse(str(tmp_path), [dep])
+
+    assert dep.consumed == []
+    assert dep.sites, "the include was still attributed"
+    assert any("unmeasured rather than unaffected" in n for n in dep.notes)
+
+
+# ------------------------------------ matching upstream's own declared names
+
+
+SNDFILE_H = """\
+    typedef struct SF_INFO { int frames; } SF_INFO;
+    typedef struct SNDFILE_tag SNDFILE;
+    SNDFILE* sf_open(const char *path, int mode, SF_INFO *info);
+    long sf_readf_float(SNDFILE *f, float *ptr, long frames);
+    int sf_close(SNDFILE *f);
+    int sf_command(SNDFILE *f, int cmd, void *data, int n);
+"""
+
+
+def test_declared_names_replace_the_prefix_guess(tmp_path):
+    """No guess is needed once upstream's own declarations are in hand.
+
+    The API diff has already read them out of the headers, so intersecting them
+    with our sources costs nothing and fixes every library whose symbols do not
+    carry its package name.
+    """
+    from deptool import apidiff
+    from deptool.backends import builtin
+
+    _write(tmp_path, "src/snd.c", """\
+        #include <sndfile.h>
+        void go(void) {
+            SF_INFO info;
+            SNDFILE *f = sf_open("a.wav", 0x10, &info);
+            sf_close(f);
+        }
+    """)
+    dep = Dep(name="libsndfile", kind="pkg-config")
+    builtin.analyse(str(tmp_path), [dep])
+    assert dep.consumed == []
+
+    declared = apidiff.unqualified_names(apidiff.declarations(textwrap.dedent(SNDFILE_H)))
+    gained = builtin.absorb_declared(str(tmp_path), dep, declared)
+
+    assert set(gained) == {"SF_INFO", "SNDFILE", "sf_open", "sf_close"}
+    assert "sf_command" not in gained, "declared upstream but we never mention it"
+    assert dep.consumed == sorted(gained)
+    assert any("own headers rather than by name prefix" in n for n in dep.notes)
+
+
+def test_our_own_declarations_are_not_claimed_as_theirs(tmp_path):
+    """A dependency and this project can easily declare the same bare name.
+
+    Attributing ours to them puts a symbol in the profile whose removal upstream
+    would not affect us at all.
+    """
+    from deptool import apidiff
+    from deptool.backends import builtin
+
+    _write(tmp_path, "src/graph.cpp", """\
+        #include <yaml-cpp/yaml.h>
+        struct Node { int id; };
+        Node *root_node = nullptr;
+    """)
+    dep = Dep(name="yaml-cpp", kind="cmake-fetchcontent-url")
+    builtin.analyse(str(tmp_path), [dep])
+
+    declared = apidiff.unqualified_names(apidiff.declarations("struct Node { int x; };\n"))
+    assert "Node" in declared
+    assert builtin.absorb_declared(str(tmp_path), dep, declared) == []
+
+
+def test_namespaced_declarations_are_never_matched_bare():
+    """`Node` inside `namespace YAML` is spelled `YAML::Node` at the use site.
+
+    That spelling is already matched by the prefix/namespace harvest, and a bare
+    `Node` is far too collision-prone to attribute on the name alone.
+    """
+    from deptool import apidiff
+
+    index = apidiff.declarations(
+        "namespace YAML {\nclass Node { };\n}\nint free_fn(int a);\n"
+    )
+    assert apidiff.unqualified_names(index) == {"free_fn"}
+
+
+def test_widening_the_surface_finds_a_break_that_was_invisible(tmp_path):
+    """End to end: the case that used to be skipped in silence.
+
+    With no consumed symbols the dependency was never diffed at all, so a
+    signature change in a function we call at a known line produced no output
+    whatsoever.
+    """
+    from deptool import apidiff
+
+    after = textwrap.dedent(SNDFILE_H).replace("float *ptr", "double *ptr")
+    _write(tmp_path, "src/snd.c", """\
+        #include <sndfile.h>
+        void go(void) {
+            SF_INFO info;
+            SNDFILE *f = sf_open("a.wav", 0x10, &info);
+            sf_readf_float(f, 0, 0);
+        }
+    """)
+    dep = Dep(name="libsndfile", kind="pkg-config", version="1.0.28",
+              upstream=Upstream(kind="github", ref="libsndfile/libsndfile"))
+
+    files = {
+        ("1.0.28", "include/sndfile.h"): textwrap.dedent(SNDFILE_H),
+        ("1.2.2", "include/sndfile.h"): after,
+    }
+    fetch, tree = _fake_headers(files, ["include/sndfile.h"])
+    got = apidiff.surface_change(
+        dep, "1.0.28", "1.2.2",
+        versions=[{"version": "1.0.28", "tag": "1.0.28"},
+                  {"version": "1.2.2", "tag": "1.2.2"}],
+        fetch=fetch, tree=tree, root=str(tmp_path),
+    )
+
+    assert "sf_readf_float" in got["consumed_added"]
+    hit = next(h for h in got["affects_us"] if h["symbol"] == "sf_readf_float")
+    assert hit["change"] == "signature"
+    assert hit["sites"] == ["src/snd.c:5"]
+    # Nothing we consume went unaccounted for, since the widening drew on the
+    # very headers that were read.
+    assert got["not_located"] == []
+
+
+def test_an_empty_consumed_surface_forbids_a_clean_bill_of_health():
+    """Zero symbols in means an empty intersection out, whatever upstream did."""
+    from deptool import apidiff
+
+    dep = Dep(name="opaque", kind="pkg-config", version="1.0",
+              upstream=Upstream(kind="github", ref="o/r"))
+    files = {
+        ("1.0", "include/o.h"): "int gone_symbol(int a);\nint kept(int a);\n",
+        ("2.0", "include/o.h"): "int kept(int a);\n",
+    }
+    fetch, tree = _fake_headers(files, ["include/o.h"])
+    got = apidiff.surface_change(dep, "1.0", "2.0", fetch=fetch, tree=tree)
+
+    assert got["resolved"] is True
+    assert got["consumed_count"] == 0
+    assert got["affects_us"] == []
+    assert any("vacuous" in n for n in got["notes"])
+
+
+def test_report_distinguishes_unmeasured_from_unaffected():
+    """"nothing we consume changed" is unsayable without a consumed surface."""
+    from deptool.__main__ import _api_lines
+
+    base = {"resolved": True, "from_ref": "v1", "to_ref": "v2",
+            "headers_read": 3, "headers_available": 3, "removed": [{}, {}],
+            "affects_us": []}
+
+    measured = "\n".join(_api_lines(dict(base, consumed_count=9)))
+    assert "nothing we consume was removed" in measured
+
+    unmeasured = "\n".join(_api_lines(dict(base, consumed_count=0)))
+    assert "nothing we consume" not in unmeasured
+    assert "unmeasured, not unaffected" in unmeasured
+
+
+def test_a_dep_with_no_symbols_is_still_worth_diffing():
+    """The gate used to require `consumed`, which skipped exactly the deps
+    whose surface the diff itself could have recovered."""
+    from deptool.__main__ import _worth_diffing
+
+    dep = Dep(name="libsndfile", kind="pkg-config", version="1.0.28",
+              upstream=Upstream(kind="github", ref="libsndfile/libsndfile"),
+              sites=[Site("src/snd.c", 1, "#include <sndfile.h>")])
+    info = {"resolved": True, "behind_by": 4, "unpinned": False}
+
+    assert dep.consumed == []
+    assert _worth_diffing(dep, info) is True
+
+
+# ----------------------------------------------- the upstream side of the match
+
+
+def test_a_generated_public_header_is_still_a_public_header():
+    """libsndfile 1.0.28's entire C API is `src/sndfile.h.in`.
+
+    With only literal suffixes recognised, the diff read 20 *internal* headers,
+    never saw `sf_open`, and reported removals drawn from internal churn. The
+    include hint has to reach the template too, or it sorts as an also-ran.
+    """
+    from deptool.apidiff import as_header_path, is_header, public_headers
+
+    assert is_header("src/sndfile.h.in")
+    assert as_header_path("src/sndfile.h.in") == "src/sndfile.h"
+    assert not is_header("README.in")
+
+    tree = ["Octave/format.h", "src/common.h", "src/sndfile.h.in", "src/sndfile.hh"]
+    assert public_headers(tree, ["sndfile.h"])[0] == "src/sndfile.h.in"
+
+
+def test_enumerators_are_part_of_the_surface():
+    """`enum { A, B }` publishes A and B as surely as a function does.
+
+    Only the enum's own tag was recorded, so every constant a project consumed
+    came back `not_located` — unchecked however many headers were read. The brace
+    sits on its own line as often as not, which is how FluidSynth writes them.
+    """
+    from deptool.apidiff import declarations
+
+    index = declarations(textwrap.dedent("""\
+        enum fluid_chorus_mod
+        {
+            FLUID_CHORUS_MOD_SINE = 0,      /**< sine */
+            FLUID_CHORUS_MOD_TRIANGLE = 1
+        };
+        typedef enum { FLUID_OK = 0, FLUID_FAILED = -1 } fluid_status;
+        enum class Mode : uint8_t { Fast, Slow };
+        enum forward_declared_only;
+    """))
+    names = {d.name for decls in index.values() for d in decls}
+
+    assert {"FLUID_CHORUS_MOD_SINE", "FLUID_CHORUS_MOD_TRIANGLE"} <= names
+    assert {"FLUID_OK", "FLUID_FAILED"} <= names
+    assert {"Fast", "Slow"} <= names
+    assert "uint8_t" not in names, "the base type is not an enumerator"
+
+
+def test_renumbering_an_enum_is_not_a_signature_change():
+    """A changed value is an ABI concern, and reporting it as an API break
+    would fire on every enum that gained a member in the middle."""
+    from deptool.apidiff import declarations, diff
+
+    before = declarations("enum E { A = 0, B = 1 };\n", "e.h")
+    after = declarations("enum E { A = 0, NEW = 1, B = 2 };\n", "e.h")
+    got = diff(before, after)
+
+    assert got["changed"] == []
+    assert [d.name for d in got["removed"]] == []
+    assert "NEW" in {d.name for d in got["added"]}
+
+
+def test_a_removed_enumerator_we_consume_is_reported():
+    """The whole reason to extract them: it is a hard compile break."""
+    from deptool import apidiff
+
+    dep = Dep(name="fluidsynth", kind="pkg-config", version="2.3.4",
+              upstream=Upstream(kind="github", ref="FluidSynth/fluidsynth"),
+              consumed=["FLUID_CHORUS_MOD_SINE"],
+              sites=[Site("src/audio.cpp", 13, "FLUID_CHORUS_MOD_SINE")])
+    files = {
+        ("v2.3.4", "include/fs/synth.h"): "enum m\n{\n  FLUID_CHORUS_MOD_SINE = 0,\n  X = 1\n};\n",
+        ("v2.5.7", "include/fs/synth.h"): "enum m\n{\n  X = 1\n};\n",
+    }
+    fetch, tree = _fake_headers(files, ["include/fs/synth.h"])
+    got = apidiff.surface_change(dep, "2.3.4", "2.5.7", fetch=fetch, tree=tree)
+
+    hit = got["affects_us"][0]
+    assert hit["symbol"] == "FLUID_CHORUS_MOD_SINE"
+    assert hit["change"] == "removed"
+    assert hit["kind"] == "enumerator"
+    assert hit["sites"] == ["src/audio.cpp:13"]
+    assert got["not_located"] == []
+
+
+def test_renaming_an_opaque_tag_is_not_a_signature_change():
+    """libsndfile 1.2.2 renamed the struct behind `SNDFILE`.
+
+    The tag of an incomplete type is not something a consumer of the alias can
+    see or spell, so reporting it would send someone to fix call sites that
+    compile perfectly — the same class of false positive as a renamed parameter.
+    """
+    from deptool.apidiff import declarations, diff
+
+    before = declarations("typedef struct SNDFILE_tag SNDFILE;\n", "sndfile.h")
+    after = declarations("typedef struct sf_private_tag SNDFILE;\n", "sndfile.h")
+    assert diff(before, after)["changed"] == []
+
+    # Decoration is still part of the type, and a concrete target still is too.
+    gained_ptr = declarations("typedef struct SNDFILE_tag *SNDFILE;\n", "sndfile.h")
+    assert [c["name"] for c in diff(before, gained_ptr)["changed"]] == ["SNDFILE"]
+    to_int = declarations("typedef int SNDFILE;\n", "sndfile.h")
+    assert [c["name"] for c in diff(before, to_int)["changed"]] == ["SNDFILE"]
+
+
+# ------------------------------------------------ discovery walk and reconciliation
+#
+# The failure these cover was not a degraded answer but a confidently wrong one:
+# manifests were only ever looked for at the repository root, so a project
+# keeping one per target platform reported *no* pins, and what surfaced instead
+# was the version-less `find_package` calls resolving to a distro lookup — the
+# machine's system library compared against what distros ship.
+
+
+def _platform_repo(tmp_path, zlib=("1.3", "1.3.1"), ssl=("3.0.15", "3.0.15")):
+    """A repo shaped like the second real project: a manifest per platform,
+    nested, with the build system naming the same libraries differently."""
+    (tmp_path / "CMakeLists.txt").write_text(
+        textwrap.dedent("""
+            project(sensor CXX)
+            find_package(CURL REQUIRED)
+            find_package(ZLIB REQUIRED)
+            find_package(OpenSSL REQUIRED)
+            find_package(LibArchive REQUIRED)
+        """)
+    )
+    for i, (plat, z, s) in enumerate(
+        (("linux", zlib[0], ssl[0]), ("windows", zlib[1], ssl[1]))
+    ):
+        d = tmp_path / "deps" / plat
+        d.mkdir(parents=True)
+        (d / "conanfile.txt").write_text(
+            f"[requires]\nlibcurl/8.4.0\nzlib/{z}\nopenssl/{s}\nlibarchive/3.8.1\n"
+        )
+    return str(tmp_path)
+
+
+def test_manifests_are_found_below_the_root(tmp_path):
+    from deptool import discover
+
+    root = _platform_repo(tmp_path)
+    found = discover.detect_manifests(root)
+    assert ("CMakeLists.txt", "cmake") in found
+    assert ("deps/linux/conanfile.txt", "conan") in found
+    assert ("deps/windows/conanfile.txt", "conan") in found
+    # Shallowest first, so the root manifest is the natural primary.
+    assert found[0][0] == "CMakeLists.txt"
+
+
+def test_nested_manifest_pins_are_what_gets_reported(tmp_path):
+    """The whole point of the walk: pins become visible, and the unpinned CMake
+    declaration no longer wins and drags the dependency to a distro lookup."""
+    from deptool import discover
+
+    deps, _ = discover.discover(_platform_repo(tmp_path))
+    by_name = {d.name: d for d in deps}
+    assert set(by_name) == {"libcurl", "zlib", "openssl", "libarchive"}
+    assert by_name["libcurl"].version == "8.4.0"
+    # Not `distro:CURL` — that framed the fix as a CI-image change.
+    assert by_name["libcurl"].upstream.kind == "conan"
+    assert by_name["libcurl"].aliases == ["CURL"]
+
+
+def test_build_output_and_vendored_containers_are_not_walked(tmp_path):
+    from deptool import discover
+
+    root = _platform_repo(tmp_path)
+    for junk in ("build/deps", "third_party/foo", "node_modules/bar", ".hidden"):
+        d = tmp_path / junk
+        d.mkdir(parents=True)
+        (d / "conanfile.txt").write_text("[requires]\nbogus/9.9.9\n")
+    deps, _ = discover.discover(root)
+    assert "bogus" not in {d.name for d in deps}
+
+
+def test_a_declared_submodule_is_not_our_dependency(tmp_path):
+    """A vendored checkout under its own name slips past SKIP_DIRS, so the
+    declared fact in .gitmodules is read instead of guessing at directory names."""
+    from deptool import discover
+
+    root = _platform_repo(tmp_path)
+    vendored = tmp_path / "tests" / "googletest"
+    vendored.mkdir(parents=True)
+    (vendored / "pyproject.toml").write_text(
+        '[project]\nname = "vendored"\ndependencies = ["requests>=2.0"]\n'
+    )
+
+    # Without .gitmodules it is still visible: finding F is open, not solved.
+    assert "requests" in {d.name for d in discover.discover(root)[0]}
+
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "tests/googletest"]\n\tpath = tests/googletest\n\turl = x\n'
+    )
+    assert discover.submodule_paths(root) == {"tests/googletest"}
+    assert "requests" not in {d.name for d in discover.discover(root)[0]}
+
+
+# ------------------------------------------------------------- canonical names
+
+
+@pytest.mark.parametrize(
+    "cmake_name,package_name",
+    [
+        ("CURL", "libcurl"),
+        ("ZLIB", "zlib"),
+        ("OpenSSL", "openssl"),
+        ("LibArchive", "libarchive"),
+        ("PNG", "libpng"),
+        ("JPEG", "libjpeg"),
+        ("SQLite3", "sqlite3"),
+        ("nlohmann_json", "nlohmann_json"),
+        ("Iconv", "libiconv"),
+        ("LibXml2", "libxml2"),
+    ],
+)
+def test_cmake_and_package_names_canonicalise_together(cmake_name, package_name):
+    """Every alias observed on a real project, resolved by one generic rule
+    rather than a table of pairs — see ROADMAP.md on constants that get guessed
+    once and inherited forever."""
+    from deptool.discover import canonical_name
+
+    assert canonical_name(cmake_name) == canonical_name(package_name)
+
+
+def test_canonicalising_does_not_strip_lib_off_a_short_name():
+    from deptool.discover import canonical_name
+
+    assert canonical_name("libc") == "libc"
+    assert canonical_name("libm") == "libm"
+
+
+def test_unrelated_libraries_do_not_canonicalise_together():
+    from deptool.discover import canonical_name
+
+    assert canonical_name("zlib") != canonical_name("zlib-ng")
+    assert canonical_name("openssl") != canonical_name("libressl")
+
+
+def test_different_ecosystems_are_not_reconciled():
+    """npm's `zlib` and Conan's `zlib` are not the same artefact."""
+    from deptool.discover import reconcile
+
+    a = Dep(name="zlib", kind="npm", version="1.0.0", declared_in="package.json (dependencies)",
+            upstream=Upstream(kind="npm", ref="zlib"))
+    b = Dep(name="zlib", kind="conan", version="1.3", declared_in="conanfile.txt:2",
+            upstream=Upstream(kind="conan", ref="zlib"))
+    assert len(reconcile([a, b])) == 2
+
+
+# ---------------------------------------------------------- variant divergence
+
+
+def test_variants_disagreeing_is_a_finding(tmp_path):
+    """No upstream lookup produces this, and for a project already current on
+    everything it is worth more than "you are a minor version behind"."""
+    from deptool import discover
+
+    deps, _ = discover.discover(_platform_repo(tmp_path))
+    zlib = next(d for d in deps if d.name == "zlib")
+    assert zlib.diverges()
+    assert zlib.pin_variants() == {
+        "1.3": ["deps/linux/conanfile.txt:3"],
+        "1.3.1": ["deps/windows/conanfile.txt:3"],
+    }
+    assert "disagree" in zlib.divergence_note()
+
+    agreeing = next(d for d in deps if d.name == "libcurl")
+    assert not agreeing.diverges()
+    assert agreeing.divergence_note() == ""
+
+
+def test_an_unversioned_declaration_is_not_disagreement(tmp_path):
+    """`find_package(CURL)` carries no version, so it cannot contradict a pin."""
+    from deptool import discover
+
+    deps, _ = discover.discover(_platform_repo(tmp_path, zlib=("1.3", "1.3")))
+    zlib = next(d for d in deps if d.name == "zlib")
+    assert len(zlib.declarations) == 3  # two manifests plus the find_package
+    assert not zlib.diverges()
+
+
+def test_the_oldest_pin_is_the_primary_when_variants_disagree(tmp_path):
+    """The reported version has to be the worst we ship: it is the copy an
+    advisory is most likely to match and the one that breaks first, so leading
+    with the newest would understate the exposure."""
+    from deptool import discover
+
+    deps, _ = discover.discover(_platform_repo(tmp_path, ssl=("3.4.0", "3.0.15")))
+    ssl = next(d for d in deps if d.name == "openssl")
+    assert ssl.version == "3.0.15"
+    assert ssl.declared_in == "deps/windows/conanfile.txt:4"
+
+
+def test_reconciliation_keeps_every_declaration_and_name(tmp_path):
+    from deptool import discover
+
+    deps, _ = discover.discover(_platform_repo(tmp_path))
+    curl = next(d for d in deps if d.name == "libcurl")
+    assert [d.where() for d in curl.declarations] == [
+        "CMakeLists.txt:3",
+        "deps/linux/conanfile.txt:2",
+        "deps/windows/conanfile.txt:2",
+    ]
+    kinds = {d.kind for d in curl.declarations}
+    assert kinds == {"cmake-find-package", "conan"}
+    assert any("pinned by the package manager" in n for n in curl.notes)
+    assert any("pinned in 2 places" in n for n in curl.notes)
+
+
+# ------------------------------------------------------- declaration round trip
+
+
+@pytest.mark.parametrize(
+    "decl",
+    [
+        Declaration(path="conanfile.txt", line=4, kind="conan",
+                    version="3.0.15", raw_pin="openssl/3.0.15"),
+        Declaration(path="CMakeLists.txt", line=3, kind="cmake-find-package"),
+        Declaration(path="vcpkg.json", kind="vcpkg", version="1.2", raw_pin="1.2"),
+    ],
+)
+def test_declaration_round_trips_through_its_rendered_form(decl):
+    back = Declaration.parse(decl.render())
+    assert back is not None
+    assert (back.path, back.line, back.kind, back.version) == (
+        decl.path, decl.line, decl.kind, decl.version
+    )
+    assert back.raw_pin == (decl.raw_pin or decl.version)
+
+
+def test_declaration_variant_is_the_declaring_directory():
+    d = Declaration(path="deps/winarm/conanfile.txt", line=2)
+    assert d.variant == "deps/winarm"
+    assert Declaration(path="conanfile.txt", line=2).variant == ""
+
+
+def test_declarations_survive_the_profile_file(tmp_path):
+    dep = Dep(
+        name="openssl", kind="conan", version="3.0.15", raw_pin="openssl/3.0.15",
+        declared_in="deps/linux/conanfile.txt:4", aliases=["OpenSSL"],
+        declarations=[
+            Declaration(path="CMakeLists.txt", line=3, kind="cmake-find-package"),
+            Declaration(path="deps/linux/conanfile.txt", line=4, kind="conan",
+                        version="3.0.15", raw_pin="openssl/3.0.15"),
+            Declaration(path="deps/win/conanfile.txt", line=4, kind="conan",
+                        version="3.4.0", raw_pin="openssl/3.4.0"),
+        ],
+    )
+    text = profile.render([dep], str(tmp_path), {})
+    back, _ = profile.parse(text)
+    assert [d.render() for d in back[0].declarations] == [
+        d.render() for d in dep.declarations
+    ]
+    assert back[0].aliases == ["OpenSSL"]
+    assert back[0].diverges()
+
+
+def test_a_single_declaration_is_not_spelled_out_twice(tmp_path):
+    """The `- pinned:` line already says it; a one-item list is noise."""
+    dep = Dep(name="fluidsynth", kind="cmake-fetchcontent-url", version="2.3.4",
+              declared_in="CMakeLists.txt:4",
+              declarations=[Declaration(path="CMakeLists.txt", line=4,
+                                        kind="cmake-fetchcontent-url", version="2.3.4")])
+    assert "- declarations:" not in profile.render([dep], str(tmp_path), {})
+
+
+# ------------------------------------------------------ bumping several pins at once
+
+
+def _multi_pin_dep(tmp_path, second="8.4.0"):
+    for plat, ver in (("linux", "8.4.0"), ("win", second)):
+        d = tmp_path / "deps" / plat
+        d.mkdir(parents=True)
+        (d / "conanfile.txt").write_text(f"[requires]\nlibcurl/{ver}\nzlib/1.3\n")
+    return Dep(
+        name="libcurl", kind="conan", version="8.4.0", raw_pin="libcurl/8.4.0",
+        declared_in="deps/linux/conanfile.txt:2",
+        declarations=[
+            Declaration(path="deps/linux/conanfile.txt", line=2, kind="conan",
+                        version="8.4.0", raw_pin="libcurl/8.4.0"),
+            Declaration(path="deps/win/conanfile.txt", line=2, kind="conan",
+                        version=second, raw_pin=f"libcurl/{second}"),
+        ],
+    )
+
+
+def test_a_bump_edits_every_manifest_pinning_the_same_version(tmp_path):
+    """Editing one platform's manifest alone would silently create exactly the
+    divergence `diverges()` exists to report."""
+    dep = _multi_pin_dep(tmp_path)
+    planned = apply_plan(str(tmp_path), dep, "8.5.0")
+    assert sorted(e["file"] for e in planned["edits"]) == [
+        "deps/linux/conanfile.txt",
+        "deps/win/conanfile.txt",
+    ]
+    assert planned["also_pinned_in"] == ["deps/win/conanfile.txt:2"]
+    assert "8.5.0" in planned["diff"]
+    # And only this dependency moves.
+    for edit in planned["edits"]:
+        assert "zlib/1.3\n" in edit["_text"]
+
+
+def test_a_bump_refuses_when_the_manifests_disagree(tmp_path):
+    """Same rule as an unresolved companion pin: stopping beats guessing, since
+    "bump to X" does not say which of the current versions it starts from."""
+    from deptool.apply import ApplyError
+
+    dep = _multi_pin_dep(tmp_path, second="8.2.0")
+    with pytest.raises(ApplyError, match="disagree on the version"):
+        apply_plan(str(tmp_path), dep, "8.5.0")
+
+
+def test_a_missing_sibling_manifest_is_reported_not_ignored(tmp_path):
+    dep = _multi_pin_dep(tmp_path)
+    (tmp_path / "deps" / "win" / "conanfile.txt").unlink()
+    planned = apply_plan(str(tmp_path), dep, "8.5.0")
+    assert planned["also_pinned_in"] == []
+    assert any("deps/win/conanfile.txt:2" in b for b in planned["blocked_on"])
+
+
+# --------------------------------------------------------- cmake entry points
+
+
+def test_a_reachable_nested_cmakelists_is_not_a_second_entry_point(tmp_path):
+    """`parse_project` already follows add_subdirectory, so parsing it again
+    would double-count."""
+    from deptool.discover import _cmake_entries
+
+    assert _cmake_entries(["CMakeLists.txt", "app/CMakeLists.txt"]) == ["CMakeLists.txt"]
+
+
+def test_without_a_root_cmakelists_the_topmost_nested_ones_are_entries():
+    from deptool.discover import _cmake_entries
+
+    assert _cmake_entries(
+        ["app/CMakeLists.txt", "app/src/CMakeLists.txt", "driver/CMakeLists.txt"]
+    ) == ["app/CMakeLists.txt", "driver/CMakeLists.txt"]
+
+
+# ------------------------------------------------- python manifests, per directory
+
+
+def test_requirements_is_the_fallback_per_directory_not_per_repository(tmp_path):
+    from deptool import discover
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "top"\ndependencies = ["httpx==0.27"]\n'
+    )
+    (tmp_path / "requirements.txt").write_text("ignored-mirror==1.0\n")
+    tool = tmp_path / "tool"
+    tool.mkdir()
+    (tool / "requirements.txt").write_text("deepdiff==8.6.2\n")
+
+    deps, files = discover.discover(str(tmp_path))
+    names = {d.name for d in deps}
+    assert names == {"httpx", "deepdiff"}
+    assert "ignored-mirror" not in names
+    assert next(d for d in deps if d.name == "deepdiff").declared_in == "tool/requirements.txt:1"
+
+
+def test_a_manifest_we_cannot_read_is_still_listed(tmp_path):
+    """A Poetry pyproject yields nothing today (ROADMAP item 2c). It must not
+    look like a project with no dependencies."""
+    from deptool import discover
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.poetry.dependencies]\nrequests = "^2.0"\n'
+    )
+    deps, files = discover.discover(str(tmp_path))
+    assert deps == []
+    assert files == ["pyproject.toml"]
+
+
+# ------------------------------------------- attribution survives the rename
+
+
+def test_symbol_attribution_uses_every_name_the_dep_is_declared_under():
+    """Reconciliation leaves the package-manager spelling as the record's name,
+    and either spelling can be the one that resolves to a header."""
+    from deptool.backends.builtin import _profile_for
+
+    plain = _profile_for(Dep(name="libcurl", kind="conan"))
+    assert "curl/" in plain["includes"]
+
+    # A curated entry reached through the alias beats the generic stem guess
+    # derived from the package name.
+    aliased = _profile_for(Dep(name="somepkg", kind="conan", aliases=["OpenSSL"]))
+    assert aliased["includes"] == ["openssl/"]
+    assert aliased["prefixes"] == ["SSL_", "EVP_", "X509_", "BIO_"]
+
+    # With no curated entry, both names contribute candidates.
+    both = _profile_for(Dep(name="libarchive", kind="conan", aliases=["LibArchive"]))
+    assert "archive.h" in both["includes"]
+    assert "libarchive/" in both["includes"]
+
+
+def test_a_submodule_reached_by_add_subdirectory_is_not_read(tmp_path):
+    """Excluding a vendored tree from the manifest walk is not enough: the CMake
+    reader follows add_subdirectory into it and would read its internal
+    find_package calls as ours."""
+    from deptool import discover
+
+    (tmp_path / "CMakeLists.txt").write_text(
+        "project(app CXX)\nfind_package(CURL REQUIRED)\nadd_subdirectory(tests/gtest)\n"
+    )
+    vendored = tmp_path / "tests" / "gtest"
+    vendored.mkdir(parents=True)
+    (vendored / "CMakeLists.txt").write_text("find_package(SomeVendoredThing REQUIRED)\n")
+
+    assert "SomeVendoredThing" in {d.name for d in discover.discover(str(tmp_path))[0]}
+
+    (tmp_path / ".gitmodules").write_text(
+        '[submodule "tests/gtest"]\n\tpath = tests/gtest\n\turl = x\n'
+    )
+    deps, files = discover.discover(str(tmp_path))
+    assert "SomeVendoredThing" not in {d.name for d in deps}
+    assert not [f for f in files if "gtest" in f]
+
+
+def test_cmake_built_in_find_modules_are_not_dependencies(tmp_path):
+    """`find_package(PythonInterp)` inside a vendored test framework was reported
+    as a runtime dependency of the product."""
+    from deptool import discover
+
+    (tmp_path / "CMakeLists.txt").write_text(
+        "project(app CXX)\nfind_package(PythonInterp)\nfind_package(Threads)\n"
+        "find_package(CURL REQUIRED)\n"
+    )
+    assert {d.name for d in discover.discover(str(tmp_path))[0]} == {"CURL"}
+
+
+# ------------------------------------------------- conan center as a version source
+#
+# Reconciliation made this necessary rather than optional: once a Conan-pinned
+# library stops being reported under its CMake name, `distro:` is no longer the
+# upstream, and without a resolver for `conan:` the daily driver went silent about
+# every dependency of a whole class of project.
+
+_CONAN_CONFIG = """\
+# Versions to keep:
+#  - the last patch of each supported release
+versions:
+  "4.0.1":
+    folder: "4.x.x"
+  "3.6.3":
+    folder: "3.x.x"
+  "3.0.15":
+    folder: "3.x.x"
+"""
+
+
+def test_conan_versions_come_from_the_recipe_index(monkeypatch):
+    from deptool import upstream
+
+    monkeypatch.setattr(upstream, "fetch_file", lambda *a, **k: _CONAN_CONFIG)
+    got = upstream._conan_versions("openssl")
+    assert [v["version"] for v in got] == ["4.0.1", "3.6.3", "3.0.15"]
+    # `folder:` carries a value, so it is not a version key; the comment header
+    # is not one either.
+    assert all(v["tag"] == v["version"] for v in got)
+
+
+def test_a_missing_recipe_resolves_to_nothing_rather_than_raising(monkeypatch):
+    from deptool import upstream
+
+    monkeypatch.setattr(upstream, "fetch_file", lambda *a, **k: "")
+    assert upstream._conan_versions("no-such-package") == []
+
+
+def test_behind_by_is_marked_a_floor_for_a_pruned_catalogue(monkeypatch):
+    """Conan Center deletes old recipe versions — `zlib` lists exactly one — so
+    a count of what is newer is a lower bound, not a release count."""
+    from deptool import upstream
+
+    monkeypatch.setattr(upstream, "fetch_file", lambda *a, **k: _CONAN_CONFIG)
+    dep = Dep(name="openssl", kind="conan", version="3.0.15",
+              upstream=Upstream(kind="conan", ref="openssl"))
+    info = upstream.summarise(dep)
+    assert info["behind_by"] == 2
+    assert info["behind_by_is_floor"] is True
+    assert info["pin_unavailable"] is False
+
+    pypi = Dep(name="httpx", kind="pypi", version="0.27.0",
+               upstream=Upstream(kind="pypi", ref="httpx"))
+    monkeypatch.setattr(upstream, "fetch_versions", lambda d: [
+        {"version": "0.28.0", "tag": "0.28.0", "date": "", "prerelease": False,
+         "notes": "", "url": ""},
+        {"version": "0.27.0", "tag": "0.27.0", "date": "", "prerelease": False,
+         "notes": "", "url": ""},
+    ])
+    assert upstream.summarise(pypi)["behind_by_is_floor"] is False
+
+
+def test_a_pin_the_index_no_longer_offers_is_a_finding(monkeypatch):
+    """A fresh install cannot reproduce the build — independent of whether an
+    upgrade is otherwise due."""
+    from deptool import upstream
+
+    monkeypatch.setattr(upstream, "fetch_file", lambda *a, **k: _CONAN_CONFIG)
+    dep = Dep(name="openssl", kind="conan", version="3.0.13",
+              upstream=Upstream(kind="conan", ref="openssl"))
+    assert upstream.summarise(dep)["pin_unavailable"] is True
+
+
+def test_a_survey_catalogue_never_reports_a_pin_as_unavailable(monkeypatch):
+    """Repology says what distros happen to ship, so a version missing from it
+    is a gap in our data rather than a fact about the dependency."""
+    from deptool import upstream
+
+    monkeypatch.setattr(upstream, "fetch_versions", lambda d: [
+        {"version": "2.5.7", "tag": "2.5.7", "date": "", "prerelease": False,
+         "notes": "", "url": ""},
+    ])
+    dep = Dep(name="fluidsynth", kind="pkg-config", version="2.3.4",
+              upstream=Upstream(kind="distro", ref="fluidsynth"))
+    assert upstream.summarise(dep)["pin_unavailable"] is False

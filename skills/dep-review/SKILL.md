@@ -1,6 +1,6 @@
 ---
 name: dep-review
-description: Decide whether available dependency updates are worth taking, by intersecting upstream release notes with the API surface this project actually consumes. Use when the user runs /deps:check, /deps:sync, /deps:rebuild or /deps:apply, or asks "are my dependencies out of date", "should I upgrade X", "is this update worth it", "check for library updates", "what's new in <library>", or asks to build or refresh CLAUDE_DEPS.md.
+description: Decide whether available dependency updates are worth taking, by intersecting what changed upstream — a factual public-header diff where one is possible, release notes otherwise — with the API surface this project actually consumes. Use when the user runs /deps:check, /deps:sync, /deps:rebuild or /deps:apply, or asks "are my dependencies out of date", "should I upgrade X", "is this update worth it", "check for library updates", "what's new in <library>", or asks to build or refresh CLAUDE_DEPS.md.
 ---
 
 # Dependency review
@@ -29,7 +29,8 @@ cd "${CLAUDE_PLUGIN_ROOT}" && python3 -m deptool --root <repo> <verb>
 |---|---|---|
 | `profile` | (Re)generate `CLAUDE_DEPS.md`. Preserves existing `### Assessment` prose unless `--force`. | no |
 | `status` | Is `CLAUDE_DEPS.md` stale? Pure content hashing. | no |
-| `check` | Full evidence: versions, release notes, advisories, consumed symbols. `--json` for structure. | yes |
+| `check` | Full evidence: versions, release notes, advisories, consumed symbols, and the public-header diff. `--json` for structure. | yes |
+| `apidiff --dep N [--to V]` | The header diff alone, over more headers than `check` budgets for. Use when `check` reported `truncated` or `not_located` and the answer matters. | yes |
 | `plan --dep N --to V` | Show the exact edit for a bump, including the re-computed archive hash and any coupled pin. Writes nothing. | yes |
 | `apply --dep N --to V [--verify]` | Write the bump *and its coupled pins*, optionally configure/build/test. Leaves a `.deptool.bak` per file. | yes |
 | `revert --dep N` | Restore the backups. | no |
@@ -121,10 +122,84 @@ For each update, the central question is:
 > **Does anything that changed upstream touch what we actually call?**
 
 `consumed` and `sites` in the evidence tell you what the project uses. The
-release notes tell you what changed. The intersection is the finding. An update
-with a huge changelog that touches nothing we call is *low value and low risk*;
-an update with a one-line changelog that renames a function we call in twelve
-places is *high effort*.
+intersection with what changed upstream is the finding. An update with a huge
+changelog that touches nothing we call is *low value and low risk*; an update
+with a one-line changelog that renames a function we call in twelve places is
+*high effort*.
+
+### `divergence` outranks "something newer exists"
+
+A finding with a non-empty `divergence` field says the repository declares the
+same dependency at **two different versions** — typically one manifest per target
+platform, disagreeing. Lead with these, ahead of any upgrade advice, for three
+reasons:
+
+- It needs no upstream lookup and no judgement about whether an upgrade is
+  worthwhile. It is a fact about the repository, and it is certain.
+- What ships depends on which manifest the build used, so every other claim
+  about that dependency — the advisory match, the header diff — is really a
+  claim about one platform. Say which.
+- For a mature project already close to current on everything, this is the only
+  finding of real size. A report that leads with "you are one minor version
+  behind" and buries "your platforms ship different TLS versions" has the
+  priorities backwards.
+
+`declarations` lists every site with the version each asserts, and `aliases`
+gives the other names the dependency is declared under (a CMake package name
+beside the package-manager one). Note that **`pinned` and the version compared
+against upstream are the *oldest* of the declared versions** — the one an
+advisory is most likely to match. So on a divergent dependency, "behind by N" is
+the gap for the worst platform, not for all of them.
+
+`/deps:apply` **refuses** a divergent dependency rather than editing one site
+and deepening the disagreement. The fix is to reconcile the manifests first;
+that is the recommendation to make, and it is usually a one-line edit rather
+than an upgrade.
+
+### Read `change_evidence` before the release notes
+
+For a C/C++ dependency with a readable GitHub upstream, the tool has already
+done that intersection *mechanically*, by diffing the public headers between the
+pinned tag and the target. Prefer it over prose in every case, because it is
+evidence rather than summary. It sits under `change_evidence` in the `check`
+JSON, in descending order of trustworthiness:
+
+| Field | What it is | How to treat it |
+|---|---|---|
+| `api_diff.affects_us` | Symbols **we consume** that were removed or re-signatured, each with our own `file:line` sites. | The load-bearing finding. Quote the symbol and the sites. |
+| `api_diff.removed` / `.changed` | Everything that changed upstream, whether we use it or not. | Context. Do not report as risk to us. |
+| `api_diff.likely_renames` | `confidence: inferred` — a removed and an added symbol share a signature and a similar name. | Offer as a probable migration path, always labelled as a guess. |
+| `migration_docs` | Upstream's own `UPGRADING.md` / `UPGRADE-x.y.md` at the target. | Stronger than release notes: this is upstream saying what it broke. |
+| `commits` | Commit subjects, fetched **only when the release notes were empty**. `breaking` holds the ones whose message announces a break. | Weakest. A subject is not a summary. |
+
+Three fields decide how much the diff is worth, and you must read them before
+saying anything reassuring:
+
+- **`consumed_count` is the size of the input to the intersection.** Zero means
+  the extractor recorded nothing we consume, so `affects_us` is empty for want of
+  an input — it says nothing whatsoever about the upgrade. Report it as
+  **unmeasured**, never as unaffected, and treat the release notes as the only
+  evidence you have.
+- **`affects_us` empty is only good news if coverage was complete.** Check
+  `truncated`. When true, the read hit its header budget.
+- **`not_located`** lists symbols we consume that appear in *no* header the diff
+  read, at either version. These are **unchecked, not unaffected.** Never fold
+  them into "nothing we call was touched". Say they could not be checked, and if
+  the decision hinges on them, run `apidiff --dep N --max-headers 80`.
+
+`consumed_added` lists symbols the diff added to `consumed` by matching the
+dependency's *own* declarations against our sources, which is how a library whose
+symbols do not carry its package name gets a usage profile at all. They are
+evidence like any other, with one caveat worth stating if you lean on one: they
+were matched against a declaration in a header, not observed being called.
+
+Removals carry `confirmed`. `true` means the symbol is established absent from
+the target's public headers. `false` means the budget cut the read short and the
+symbol may simply live somewhere unread — report it as a suspected removal.
+
+When `api_diff.resolved` is false, its `reason` says why (not a GitHub upstream,
+tag not readable, no public headers). Fall back to the release notes and **say
+that you are doing so** — the confidence in your conclusion is lower.
 
 Rank each dependency into exactly one bucket:
 
@@ -195,9 +270,25 @@ What pinned-ness legitimately determines:
   A second, separate finding worth raising here: an unpinned dependency means
   different developers may be building against different versions. That is a
   reproducibility problem independent of whether an upgrade is due.
+- **`behind_by_is_floor: true`** — the source lists only the versions still
+  offered, not a history. Conan Center deletes old recipes, so "1 behind" can
+  span many releases. Say "at least N" and never present the count as a release
+  count. The human output writes it as `1+ behind`.
+- **`pin_unavailable: true`** — the version the repo pins is **gone from the
+  index it comes from**. Raise this on its own merits, ahead of upgrade advice:
+  a fresh checkout cannot reproduce the build, and whoever runs `conan install`
+  next gets either a failure or a different version. It is common for a project
+  that has not been rebuilt from scratch in a while, and it is invisible until
+  someone tries.
 - **`cmake-system-or-fetch`** — declared as `find_package(... QUIET)` with a
   `FetchContent` fallback. Two versions are in play: what a system copy might
   provide, and what the pinned archive vendors. Flag when they can diverge.
+- **A dependency declared to the build system under one name and pinned under
+  another** (`aliases` is non-empty, and the notes say so). The package manager
+  decides the version, so `installed_here` and any distro comparison are beside
+  the point here — recommending a CI-image change for a library the project
+  statically links from its own manifest is a wrong answer, not a cautious one.
+  The actionable site is the manifest.
 - **`EXACT` version constraints** — a newer system library will silently fail
   to satisfy `find_package(x 1.2.3 EXACT)`. Call this out; it is a common
   source of "works on my machine".
@@ -208,9 +299,16 @@ What pinned-ness legitimately determines:
   for what has landed upstream since that commit, and if you cannot find why
   it was frozen, say so — "pinned to a SHA with no recorded reason, N releases
   have landed since" is a finding, not a reason to stay quiet.
-- **Release notes that are empty.** Some projects tag without notes. Say the
-  notes are unavailable and, if it matters, offer to look at the commit log
-  between tags. Do not invent a summary.
+- **Release notes that are empty.** Some projects tag without notes. The tool
+  already falls back to the commit log in that case (`change_evidence.commits`),
+  and for a C/C++ dependency the header diff does not depend on notes existing at
+  all. Say the notes are unavailable, then use what is there. Do not invent a
+  summary.
+- **A header diff that contradicts the release notes.** The diff wins. Notes are
+  written by hand and go stale; a declaration removed at the target tag is a
+  fact. Say both, and say which you are acting on. Notes claiming a removal the
+  diff cannot find is the more suspicious direction — check `truncated` and
+  `not_located` before concluding the notes are wrong.
 
 ## Output
 
@@ -239,7 +337,13 @@ load-bearing evidence for your recommendation.
   be a transitive or link-only dependency, or the extractor may have missed its
   include style.
 - Distinguish what you verified from what you inferred. "The changelog says X"
-  and "this probably means X for us" are different claims.
+  and "this probably means X for us" are different claims. The header diff is
+  the one place the tool gives you a verified answer about breakage — say so
+  when you are relying on it, and say when you are not.
+- The header diff is a regex extractor, not a compiler. It reads declarations
+  behind `#if` unconditionally and does not track constructors or out-of-line
+  definitions. Its `notes` field lists what applied to that run. A finding from
+  it is strong evidence, not proof of a compile failure.
 - The backend in use is reported by `profile`. If it is `builtin`, the symbol
   list is a heuristic; a code-graph backend (graphify, codebase-memory) would
   give call depth and reachability. Mention this once, if the user seems to
