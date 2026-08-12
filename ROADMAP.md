@@ -658,13 +658,34 @@ The scope inference is also weaker than the C++ side: it regex-matches
 guess, and unlike the CMake path it produces no `scope-evidence` the user can
 disagree with.
 
-### 3. Verify in a sandbox, not in place
+### 3. Verify in a sandbox, not in place — *shipped*
 
-`apply --verify` currently edits the working tree and leaves a `.bak`. It
-should build in a git worktree or a copy, so a failed verification never
-touches the user's checkout and several candidate versions can be tried in
-parallel — "does 0.9.0 build even though 0.11.1 doesn't?" is usually the more
-useful question than a binary pass/fail on latest.
+The premise of this tool is that it advises and, when explicitly asked, edits
+exactly the pin. A verification that edited the working tree and *then*
+discovered the build was broken had already done the thing it was run to prevent,
+and it left a `build/` directory and a `.deptool.bak` behind either way.
+
+- `apply --verify` now copies the tree somewhere disposable, applies the edits
+  **there**, builds and tests **there**, and writes to the real checkout only if
+  that passed. A bump that does not compile is a no-op on the user's tree, and
+  exits 3 so the caller knows there is nothing to revert.
+- A **copy rather than a `git worktree`**, deliberately. A worktree holds `HEAD`,
+  so it would verify the bump against code the user has not got — and creating one
+  writes into their `.git`. The cost is missing VCS metadata, so a build deriving
+  its version from `git describe` can fail in the sandbox and be fine in place;
+  `SANDBOX_NOTE` says so and `--in-place` restores the old behaviour.
+- **A skipped step is not a pass.** `established` is false when the toolchain is
+  absent, which is reported as "nothing was proved" rather than green.
+- **Backups moved out of the checkout** to
+  `${XDG_CACHE_HOME:-~/.cache}/deptool/backups/<hash of root>/`, so an apply adds
+  nothing to `git status`. A legacy in-tree `.deptool.bak` is still honoured by
+  `revert`, and restoring it removes the litter.
+
+Not done, and the reason item 4 is still open: the second half of this item was
+"several candidate versions can be tried in parallel". The sandbox makes that
+possible — `make_sandbox` is independent per call — but nothing yet drives it, so
+"does 0.9.0 build even though 0.11.1 doesn't?" still has to be asked one version
+at a time.
 
 ### 4. Bisect to the last good version
 

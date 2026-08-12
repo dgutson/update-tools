@@ -482,10 +482,27 @@ python3 -m deptool --root ~/src/zeta-daw revert --dep hegel
 ```
 
 `--json` on `profile`, `status`, `check` and `apidiff` gives machine-readable
-output. `plan` writes nothing; `apply` leaves a `.deptool.bak` beside the edited
-file. `check` runs the header diff automatically for C/C++ dependencies with a
+output. `check` runs the header diff automatically for C/C++ dependencies with a
 readable GitHub upstream; `--no-api-diff` skips it and `--max-headers N` widens
 the budget.
+
+### What touches your files, and when
+
+Everything except `apply` is read-only. `profile` writes `CLAUDE_DEPS.md` and
+nothing else; `check`, `status`, `apidiff` and `plan` write nothing at all —
+`plan` exists precisely so you can see the edit before agreeing to it.
+
+`apply` edits your manifest, and only when you run it. Two things keep that
+contained:
+
+- **`--verify` builds in a throwaway copy of your tree, and applies only if the
+  build passes.** A bump that does not compile leaves your checkout exactly as it
+  was, and no `build/` directory appears in it. VCS metadata is not copied, so a
+  build that derives its version from `git describe` may need `--in-place`, which
+  restores the old edit-then-build behaviour.
+- **Backups live outside your checkout**, under
+  `${XDG_CACHE_HOME:-~/.cache}/deptool/backups/`, so an apply adds nothing to
+  `git status`. `revert` restores from there.
 
 ## Development
 

@@ -546,14 +546,49 @@ def cmd_apply(args) -> int:
         )
         return 2
 
-    apply_mod.write(args.root, planned)
     result = _strip_private(planned)
+
+    # Verify *before* writing. A verification that edits the tree and then finds
+    # the build broken has already done the thing it was run to prevent.
+    sandbox_note = ""
+    if args.verify and not args.in_place:
+        checked = apply_mod.verify_plan(args.root, planned, args.build_dir)
+        result["verify"] = checked["steps"]
+        result["verified_ok"] = checked["ok"]
+        result["verified_in_sandbox"] = True
+        sandbox_note = checked["note"]
+        if not checked["ok"]:
+            print(
+                f"not applying {dep.name}: the bump to {args.to} does not build. "
+                "Your tree is unchanged.",
+                file=sys.stderr,
+            )
+            for step in checked["steps"]:
+                if "skipped" in step:
+                    print(f"  skipped: {step['cmd']} — {step['skipped']}", file=sys.stderr)
+                elif not step["ok"]:
+                    print(f"  FAIL: {step['cmd']}", file=sys.stderr)
+                    print("    " + step["output"].replace("\n", "\n    "), file=sys.stderr)
+            print(f"  ({checked['note']})", file=sys.stderr)
+            result["applied"] = False
+            _emit(result, args.json, lambda r: None)
+            return 3
+        if not checked["established"]:
+            print(
+                "  ! nothing was actually verified — the build toolchain is not "
+                "installed here; applying anyway because you asked to apply",
+                file=sys.stderr,
+            )
+
+    apply_mod.write(args.root, planned)
     result["applied"] = True
-    if args.verify:
+    result["backup_dir"] = apply_mod.backup_dir(args.root)
+    if args.verify and args.in_place:
         result["verify"] = apply_mod.verify(args.root, args.build_dir)
         result["verified_ok"] = all(
             s.get("ok", True) for s in result["verify"] if "skipped" not in s
         )
+        result["verified_in_sandbox"] = False
 
     def human(r):
         print(f"applied {r['dep']} {r['from']} -> {r['to']} in {r['file']}")
@@ -566,8 +601,10 @@ def cmd_apply(args) -> int:
                 print(f"    {c['evidence']}")
             for note in c.get("notes") or []:
                 print(f"    ! {note}")
-        for e in r["edits"]:
-            print(f"  backup: {e['file']}.deptool.bak  (deptool revert restores it)")
+        if sandbox_note:
+            print(f"  {sandbox_note}")
+        print(f"  backups kept outside your tree in {r['backup_dir']} "
+              f"(deptool revert restores them)")
         for step in r.get("verify", []):
             if "skipped" in step:
                 print(f"  skipped: {step['cmd']} — {step['skipped']}")
@@ -664,7 +701,15 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("apply", parents=[common], help="write the bump (and optionally verify)")
     sp.add_argument("--dep", required=True)
     sp.add_argument("--to", required=True)
-    sp.add_argument("--verify", action="store_true", help="configure, build and test after editing")
+    sp.add_argument(
+        "--verify", action="store_true",
+        help="build and test the bump in a throwaway copy first; apply only if it passes",
+    )
+    sp.add_argument(
+        "--in-place", action="store_true",
+        help="with --verify, edit and build in your own tree instead of a copy "
+             "(needed only when the build requires VCS metadata)",
+    )
     sp.add_argument("--build-dir", default="build")
     sp.add_argument("--ignore-companions", action="store_true", help=companion_help)
     sp.set_defaults(func=cmd_apply)

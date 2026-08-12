@@ -32,8 +32,8 @@ cd "${CLAUDE_PLUGIN_ROOT}" && python3 -m deptool --root <repo> <verb>
 | `check` | Full evidence: versions, release notes, advisories, consumed symbols, and the public-header diff. `--json` for structure. | yes |
 | `apidiff --dep N [--to V]` | The header diff alone, over more headers than `check` budgets for. Use when `check` reported `truncated` or `not_located` and the answer matters. | yes |
 | `plan --dep N --to V` | Show the exact edit for a bump, including the re-computed archive hash and any coupled pin. Writes nothing. | yes |
-| `apply --dep N --to V [--verify]` | Write the bump *and its coupled pins*, optionally configure/build/test. Leaves a `.deptool.bak` per file. | yes |
-| `revert --dep N` | Restore the backups. | no |
+| `apply --dep N --to V [--verify]` | Write the bump *and its coupled pins*. With `--verify`, builds in a throwaway copy first and writes **only if it passes**. Backups go outside the repo. | yes |
+| `revert --dep N` | Restore the backups from the cache dir. | no |
 
 Use `--json` when you need to reason over the data; use plain output when you
 are just showing the user progress.
@@ -72,9 +72,15 @@ prose, and confirm before running it.
 
 1. Run `plan` first, always. Show the user the diff and the new hash.
 2. Get explicit confirmation before `apply`. This edits their build files.
-3. Prefer `apply --verify`. If `cmake` or `ctest` is missing, the tool reports
-   the step as skipped — relay that honestly rather than implying it passed.
-4. If verification fails, show the failing output and offer `revert`.
+3. Prefer `apply --verify`. It builds the bump in a throwaway copy of the tree
+   and writes to the real one only if that passed, so a bump that does not
+   compile is a no-op on their checkout and leaves no `build/` behind. If `cmake`
+   or `ctest` is missing the step is reported as skipped and the bump is applied
+   regardless — relay that nothing was proved, rather than implying it passed.
+4. If verification fails (**exit 3**) nothing was written, so there is nothing to
+   revert — do not offer it. Show the failing output. `--in-place` restores the
+   old edit-then-build behaviour and is worth suggesting only when the failure
+   looks like missing VCS metadata, e.g. a build that runs `git describe`.
 5. Never apply more than one dependency at a time without asking. When a build
    breaks, one change at a time is what makes it diagnosable.
 6. If `apply` **refuses** (exit 2, unresolved coupled pin), do not reach for

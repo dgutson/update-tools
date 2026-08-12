@@ -6,6 +6,7 @@ version-swap regex (a bad edit corrupts CMakeLists.txt).
 """
 
 import os
+import shutil
 import sys
 import textwrap
 
@@ -2369,3 +2370,159 @@ def test_a_survey_catalogue_never_reports_a_pin_as_unavailable(monkeypatch):
     dep = Dep(name="fluidsynth", kind="pkg-config", version="2.3.4",
               upstream=Upstream(kind="distro", ref="fluidsynth"))
     assert upstream.summarise(dep)["pin_unavailable"] is False
+
+
+# --------------------------------------------- verifying without touching the tree
+#
+# ROADMAP item 3. A verification that edits the working tree and *then* finds the
+# build broken has already done the thing it was run to prevent, and the tool is
+# only ever invited to edit the pin — not to leave anything else behind.
+
+
+def _pinned_repo(tmp_path):
+    (tmp_path / "CMakeLists.txt").write_text(
+        "project(app CXX)\n"
+        "include(FetchContent)\n"
+        "FetchContent_Declare(hegel\n"
+        "  URL https://github.com/h/h/archive/refs/tags/v0.7.4.tar.gz)\n"
+    )
+    return Dep(
+        name="hegel", kind="cmake-fetchcontent-url", version="0.7.4",
+        raw_pin="https://github.com/h/h/archive/refs/tags/v0.7.4.tar.gz",
+        declared_in="CMakeLists.txt:3",
+        declarations=[Declaration(path="CMakeLists.txt", line=3,
+                                  kind="cmake-fetchcontent-url", version="0.7.4")],
+    )
+
+
+def test_backups_are_kept_out_of_the_users_tree(tmp_path, monkeypatch):
+    from deptool.apply import backup_dir, revert, write
+
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    dep = _pinned_repo(repo)
+
+    planned = apply_plan(str(repo), dep, "0.9.0")
+    assert write(str(repo), planned) == ["CMakeLists.txt"]
+    assert "v0.9.0" in (repo / "CMakeLists.txt").read_text()
+
+    # Nothing new in the tree at all — a `.bak` beside the file lands in
+    # `git status` and gets committed by accident.
+    assert [p.name for p in repo.iterdir()] == ["CMakeLists.txt"]
+    assert os.path.isfile(os.path.join(backup_dir(str(repo)), "CMakeLists.txt"))
+    assert str(cache) in backup_dir(str(repo))
+
+    assert revert(str(repo), planned) is True
+    assert "v0.7.4" in (repo / "CMakeLists.txt").read_text()
+
+
+def test_a_legacy_in_tree_backup_is_still_honoured_and_removed(tmp_path, monkeypatch):
+    """A bump applied by an older version must still be undoable, and undoing it
+    should take the litter with it."""
+    from deptool.apply import revert
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "CMakeLists.txt").write_text("bumped\n")
+    (repo / "CMakeLists.txt.deptool.bak").write_text("original\n")
+
+    assert revert(str(repo), {"edits": [{"file": "CMakeLists.txt"}]}) is True
+    assert (repo / "CMakeLists.txt").read_text() == "original\n"
+    assert not list(repo.glob("*.deptool.bak"))
+
+
+def test_the_sandbox_copies_sources_and_skips_build_output(tmp_path):
+    from deptool.apply import make_sandbox
+
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "CMakeLists.txt").write_text("project(app)\n")
+    (repo / "src" / "main.cpp").write_text("int main(){}\n")
+    for junk in ("build", ".git", "node_modules", "_deps"):
+        d = repo / junk
+        d.mkdir()
+        (d / "heavy.bin").write_text("x" * 100)
+
+    sandbox = make_sandbox(str(repo))
+    try:
+        assert os.path.isfile(os.path.join(sandbox, "src", "main.cpp"))
+        assert sorted(os.listdir(sandbox)) == ["CMakeLists.txt", "src"]
+        # And it is not inside the user's checkout.
+        assert not os.path.abspath(sandbox).startswith(os.path.abspath(str(repo)))
+    finally:
+        shutil.rmtree(os.path.dirname(sandbox), ignore_errors=True)
+
+
+def test_a_failed_verification_leaves_the_tree_untouched(tmp_path, monkeypatch, capsys):
+    """The whole point of item 3: the edit is proven in a copy, so a bump that
+    does not build is a no-op on the user's checkout."""
+    from deptool import apply as apply_mod
+    from deptool.__main__ import main
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    dep = _pinned_repo(repo)
+    monkeypatch.setattr("deptool.__main__._find_dep", lambda root, name: dep)
+    monkeypatch.setattr("deptool.__main__._resolve_companions", lambda d, to: [])
+
+    seen: dict = {}
+
+    def fake_verify(root, build_dir="build"):
+        seen["root"] = root
+        seen["edited"] = open(os.path.join(root, "CMakeLists.txt")).read()
+        return [{"cmd": "cmake --build", "ok": False, "output": "error: no such tag"}]
+
+    monkeypatch.setattr(apply_mod, "verify", fake_verify)
+
+    code = main(["apply", "--root", str(repo), "--dep", "hegel",
+                 "--to", "0.9.0", "--verify"])
+    assert code == 3
+    # The build ran somewhere else, against the edited copy.
+    assert seen["root"] != str(repo)
+    assert "v0.9.0" in seen["edited"]
+    # And the real file never changed.
+    assert "v0.7.4" in (repo / "CMakeLists.txt").read_text()
+    assert list(repo.iterdir()) == [repo / "CMakeLists.txt"]
+    err = capsys.readouterr().err
+    assert "Your tree is unchanged." in err
+    assert "error: no such tag" in err
+
+
+def test_a_passing_verification_then_writes_the_bump(tmp_path, monkeypatch):
+    from deptool import apply as apply_mod
+    from deptool.__main__ import main
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    dep = _pinned_repo(repo)
+    monkeypatch.setattr("deptool.__main__._find_dep", lambda root, name: dep)
+    monkeypatch.setattr("deptool.__main__._resolve_companions", lambda d, to: [])
+    monkeypatch.setattr(apply_mod, "verify", lambda root, build_dir="build": [
+        {"cmd": "cmake --build", "ok": True, "output": ""}
+    ])
+
+    assert main(["apply", "--root", str(repo), "--dep", "hegel",
+                 "--to", "0.9.0", "--verify"]) == 0
+    assert "v0.9.0" in (repo / "CMakeLists.txt").read_text()
+    assert not list(repo.glob("*.deptool.bak"))
+
+
+def test_missing_toolchain_is_not_a_pass(tmp_path, monkeypatch, capsys):
+    """A `skipped` step establishes nothing, and must not read as a green build."""
+    from deptool import apply as apply_mod
+
+    monkeypatch.setattr(apply_mod, "verify", lambda root, build_dir="build": [
+        {"cmd": "cmake", "skipped": "cmake not installed — cannot verify locally"}
+    ])
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    dep = _pinned_repo(repo)
+    planned = apply_plan(str(repo), dep, "0.9.0")
+    checked = apply_mod.verify_plan(str(repo), planned)
+    assert checked["ok"] is True          # nothing failed ...
+    assert checked["established"] is False  # ... but nothing was shown either

@@ -10,10 +10,12 @@ exactly what would change.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -242,12 +244,32 @@ def _edits_of(planned: dict) -> list[dict]:
     ]
 
 
+def backup_dir(root: str) -> str:
+    """Where originals are kept — outside the user's checkout, deliberately.
+
+    A `.deptool.bak` beside the file shows up in `git status`, gets committed by
+    accident, and has to be cleaned up by hand. When invited to edit a pin the
+    tool should edit the pin and leave no other trace in the tree.
+
+    `XDG_CACHE_HOME` is read per call rather than at import, so the location
+    follows the environment the process is actually running in.
+    """
+    home = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache"
+    )
+    key = hashlib.sha256(os.path.abspath(root).encode()).hexdigest()[:16]
+    return os.path.join(home, "deptool", "backups", key)
+
+
 def write(root: str, planned: dict) -> list[str]:
     """Apply every edit in the plan. Returns the files written."""
     written = []
+    bdir = backup_dir(root)
     for edit in _edits_of(planned):
         full = os.path.join(root, edit["file"])
-        shutil.copy2(full, full + ".deptool.bak")
+        bak = os.path.join(bdir, edit["file"])
+        os.makedirs(os.path.dirname(bak), exist_ok=True)
+        shutil.copy2(full, bak)
         with open(full, "w", encoding="utf-8") as fh:
             fh.write(edit["_text"])
         written.append(edit["file"])
@@ -255,15 +277,94 @@ def write(root: str, planned: dict) -> list[str]:
 
 
 def revert(root: str, planned: dict) -> bool:
-    """Restore every backup this plan made. True if anything was restored."""
+    """Restore every backup this plan made. True if anything was restored.
+
+    The legacy in-tree `.deptool.bak` is still honoured, so a bump applied by an
+    older version can be undone — and restoring it removes the litter.
+    """
     restored = False
+    bdir = backup_dir(root)
     for edit in _edits_of(planned):
         full = os.path.join(root, edit["file"])
-        bak = full + ".deptool.bak"
-        if os.path.isfile(bak):
-            shutil.move(bak, full)
-            restored = True
+        for bak in (os.path.join(bdir, edit["file"]), full + ".deptool.bak"):
+            if os.path.isfile(bak):
+                shutil.move(bak, full)
+                restored = True
+                break
     return restored
+
+
+# ------------------------------------------------------------------- sandbox
+#
+# A verification that edits the working tree and *then* discovers the build is
+# broken has already done the damage it was run to avoid. So the edits are made
+# in a throwaway copy, the build runs there, and the real tree is written only
+# once it passed.
+
+SANDBOX_SKIP = {
+    ".git", ".hg", ".svn", "build", "_build", "out", "dist", "node_modules",
+    "target", "__pycache__", ".venv", "venv", "_deps", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache", ".tox", "cmake-build-debug",
+    "cmake-build-release",
+}
+
+SANDBOX_NOTE = (
+    "verified in a throwaway copy, so nothing was written to your tree; VCS "
+    "metadata is not copied, so a build that derives its version from "
+    "`git describe` can fail here and be fine in place — re-run with "
+    "--in-place if that is what happened"
+)
+
+
+def _sandbox_ignore(build_dir: str):
+    skip = SANDBOX_SKIP | {build_dir}
+
+    def ignore(_dir: str, names: list[str]) -> list[str]:
+        return [n for n in names if n in skip or n.endswith(".deptool.bak")]
+
+    return ignore
+
+
+def make_sandbox(root: str, build_dir: str = "build") -> str:
+    """Copy the working tree somewhere disposable. Returns the copy's path.
+
+    A copy rather than a `git worktree`, for two reasons: a worktree holds HEAD
+    rather than the tree as it currently stands, so it would verify a bump
+    against code the user has not got, and creating one writes into their
+    `.git`. The cost is the missing VCS metadata, which `SANDBOX_NOTE` states
+    rather than hides.
+    """
+    holder = tempfile.mkdtemp(prefix="deptool-verify-")
+    target = os.path.join(holder, os.path.basename(os.path.abspath(root)) or "src")
+    shutil.copytree(root, target, ignore=_sandbox_ignore(build_dir), symlinks=True)
+    return target
+
+
+def verify_plan(root: str, planned: dict, build_dir: str = "build") -> dict:
+    """Apply the plan to a disposable copy and build it there.
+
+    The caller writes to the real tree only when `ok` is true, which is what
+    makes a failed verification a no-op on the user's checkout.
+    """
+    sandbox = make_sandbox(root, build_dir)
+    try:
+        for edit in _edits_of(planned):
+            full = os.path.join(sandbox, edit["file"])
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as fh:
+                fh.write(edit["_text"])
+        steps = verify(sandbox, build_dir)
+    finally:
+        shutil.rmtree(os.path.dirname(sandbox), ignore_errors=True)
+    return {
+        "steps": steps,
+        # A skipped step is not a pass, and it is not a failure either — it means
+        # the toolchain is absent, so nothing was actually established.
+        "ok": all(s.get("ok", True) for s in steps if "skipped" not in s),
+        "established": any("skipped" not in s for s in steps),
+        "sandboxed": True,
+        "note": SANDBOX_NOTE,
+    }
 
 
 def _run(cmd: list[str], root: str, timeout: int) -> dict:
