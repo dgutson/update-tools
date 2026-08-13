@@ -68,6 +68,21 @@ def plan(root: str, dep: Dep, new_version: str, companions: list[dict] | None = 
     """
     if not dep.declared_in:
         raise ApplyError(f"{dep.name}: no declaration site recorded")
+    dep.ensure_declaration()
+    if dep.version and not any(d.is_editable() for d in dep.declarations):
+        # Report-only: this is pinned somewhere, but every site recording it is
+        # either generated or was reported without a line. Both are perfectly
+        # good evidence for judging an upgrade and neither is something to edit
+        # — rewriting a lockfile by hand desynchronises it from the revisions
+        # beside it, and editing a file at a guessed position is worse than
+        # declining. A dependency with no version at all is a different case
+        # and gets its own message below.
+        where = ", ".join(sorted({d.where() or d.kind for d in dep.declarations}))
+        raise ApplyError(
+            f"{dep.name}: report-only — the only record of it is {where}, which is "
+            f"not a declaration this tool may edit. If it is transitive, bump "
+            f"whatever pulls it in; if it is locked, regenerate the lock."
+        )
     if dep.diverges():
         # Editing one site would deepen the disagreement rather than resolve it,
         # and "bump to X" does not say which of the current versions it is
@@ -141,6 +156,7 @@ def plan(root: str, dep: Dep, new_version: str, companions: list[dict] | None = 
     # that `Dep.diverges()` exists to report. `diverges()` was checked above, so
     # every sibling here agrees with `old_version`.
     also_pinned_in: list[str] = []
+    regenerate = [d.where() for d in dep.declarations if d.is_generated() and d.version]
     for sib in dep.declarations:
         if not sib.is_editable() or sib.where() == dep.declared_in:
             continue
@@ -220,6 +236,10 @@ def plan(root: str, dep: Dep, new_version: str, companions: list[dict] | None = 
         "companion_edits": companion_edits,
         # Further manifests pinning the same version, bumped in the same plan.
         "also_pinned_in": also_pinned_in,
+        # Generated files still recording the old version. Deliberately not
+        # edited — but a bump nobody regenerates the lock for changes the
+        # manifest and not the build, which is the worst of both outcomes.
+        "regenerate": regenerate,
         "blocked_on": blocked_on,
         "edits": edits,
         "diff": "".join(e["diff"] for e in edits),

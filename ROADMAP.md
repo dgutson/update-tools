@@ -304,7 +304,7 @@ whether the diverging versions differ in a symbol the project consumes.
 This is a data-model change, so it should land before more parsers are written
 against the current shape.
 
-### C. The lockfile holds a different truth from the manifest
+### C. The lockfile holds a different truth from the manifest — *shipped, see [0.5.0](#shipped-in-050--the-lockfile-and-an-ingested-scanner)*
 
 The project has a Conan lockfile, and it pins one library **two minor versions
 behind what every manifest requires**. Either the lock is stale or the build is
@@ -542,6 +542,103 @@ in bulk; the sentinel guard keeps them honestly labelled but the list is long.
 
 ---
 
+## Shipped in 0.5.0 — the lockfile, and an ingested scanner
+
+Finding C, and item 7's first source. Both answer "what is actually built"
+rather than "is there something newer", which is the shift
+[the second project forced](#what-this-changes-about-the-strategy).
+
+### The lockfile is a declaration site of its own
+
+`conan.lock` is parsed natively — Conan 2's flat `requires` / `build_requires` /
+`python_requires` / `config_requires` lists and Conan 1's `graph_lock.nodes`
+object. Line numbers are recovered by scanning the raw text in document order,
+because `json.load` discards positions and a resolved version nobody can go and
+look at is half a fact. The format permits the same package twice at two
+versions, so nothing assumes uniqueness.
+
+What it produces, none of it from a network call:
+
+- **Manifest-versus-lock divergence.** `Dep.lock_drift()` reports versions the
+  lock resolved that no manifest asks for. On the second project that is one
+  library **two minor versions behind** every manifest — either the lock is
+  stale or the build is not using it.
+- **The transitive set.** Three libraries ship that no conanfile names. They are
+  marked transitive, because their usage profile is empty *by construction* and
+  an empty profile read as "unused" is exactly the confidently-wrong answer this
+  tool exists to avoid.
+- **Build-only requirements separated**, so eight build tools are not reported
+  as runtime risk.
+- **One package locked at two versions at once** — a build requirement resolved
+  differently for two profiles — reported rather than silently deduplicated.
+
+Two consequences were bigger than the parser:
+
+- **A lockfile pin is not editable.** It has a version, a path and a line, so it
+  looks exactly like a declaration `apply` may rewrite — but the version sits
+  beside the recipe revision it was resolved with, and hand-editing one
+  desynchronises the pair. `GENERATED_KINDS` marks the kind, `is_editable()`
+  excludes it, and `apply` refuses any dependency whose every declaration is
+  uneditable. What it does instead is report `regenerate`: the generated files
+  that still record the old version, because a bump nobody regenerates the lock
+  for changes the declaration and not the build.
+- **`diverges()` now means the *hand-written* declarations disagree.** It is the
+  predicate `apply` refuses on, and a stale lock must not block a bump: two
+  manifests contradicting each other means the edit has no defined starting
+  point, whereas a lock contradicting the manifests is a fact about the past.
+  Left as one predicate, the lockfile parser would have blocked every legitimate
+  bump on the project it was written for.
+
+### Trivy as a discovery source
+
+`sources.py` is the analogue of `backends/`: auto-detected, never required,
+merged additively. Trivy only — one static Go binary, no runtime to depend on
+(ORT needs a JVM, dependabot-core is Ruby in Docker).
+
+- **Report-only is enforced by the model, not by a special case.** An ingested
+  package with no line number has no editable declaration, and the gate `apply`
+  already needs for lockfiles refuses it.
+- **Merged, not preferred.** An ingested `conan.lock` line is recorded as the
+  same kind our own parser records, so the two collapse to one declaration; the
+  native site keeps the line `apply` edits.
+- **Families are not merged across ecosystems.** An ingested ecosystem with no
+  native parser is its own namespace, so a NuGet package and a `find_package`
+  result that share a name stay separate rather than inventing a fact.
+- **The invocation was measured, not assumed.** `--list-all-pkgs` with the native
+  JSON format is the only shape carrying `Locations`; CycloneDX and SPDX drop
+  line numbers. Package analysis needs *some* scanner enabled, and the choice is
+  not free: `vuln` against a cached database took 0.8s on a real repository where
+  `secret` took 5.1s. So the fast path runs first and offline
+  (`--skip-db-update --offline-scan`), with `secret` as the fallback for a fresh
+  install whose database has never been downloaded — never a silent 50MB fetch.
+
+Measured against the second real project:
+
+| | native only | with the ingest |
+|---|---|---|
+| dependencies found | 18 | **32** |
+| ecosystems | C/C++, Python | + NuGet (15 packages, 5 manifests, **no native parser**) |
+| conan packages | 18 | 18 — Trivy's 9 are a strict subset and collapse into ours |
+| cost | 0.10s | 0.65s |
+
+Trivy reads `conan.lock` but not `conanfile.txt`, and takes only `requires` from
+the lock — so for Conan the native parser is strictly better and the ingest adds
+nothing but confirmation. Its value is the ecosystem nobody here parses at all,
+which is precisely the split item 7 predicted.
+
+Ingest is on by default and `--no-ingest` turns it off; the profile header
+records which sources ran, because "no dependencies" means something different
+when only the native parsers were used. The test suite disables it globally
+(`tests/conftest.py`) and switches it back on against a fake binary — otherwise
+every discovery test would depend on what is installed on the machine running it.
+
+Still not done here: Trivy's own vulnerability findings are ignored (the OSV path
+already covers that, and reconciling two advisory sources is its own decision),
+and an ingested NuGet package has no upstream resolver, so it is discovered and
+reported but "is there something newer" is answered honestly with "no resolver".
+
+---
+
 ## Near term
 
 ### 1. Companion pins upstream declares nowhere **(observed)**
@@ -729,7 +826,7 @@ fixed as of 0.3.0 (above), which was the stated prerequisite. What remains:
   most of them — but for a dependency consumed as a prebuilt binary (item 1's
   motivating case) ABI is exactly what matters, so the two items meet here.
 
-### 7. Ingest an SCA tool as a discovery source — *replaces "more ecosystems"*
+### 7. Ingest an SCA tool as a discovery source — *Trivy shipped, see [0.5.0](#shipped-in-050--the-lockfile-and-an-ingested-scanner)*
 
 This item used to read "write parsers for Gradle/Maven, NuGet, SwiftPM, Bazel,
 Nix." That was wrong, and the survey in [Prior art](#prior-art--what-not-to-build)
@@ -768,6 +865,13 @@ depend on, and it covers the Python managers below.
 Only direct dependencies are profiled. A CVE usually lands in a transitive one.
 This needed "lockfile parsing per ecosystem", which is exactly what item 7
 ingests instead — Trivy and ORT both emit a resolved tree.
+
+**Partly shipped in 0.5.0 for Conan**, and by the native parser rather than the
+ingest: `conan.lock` names the transitive set, so those dependencies are now
+discovered, scoped and marked transitive. What is *not* shipped is the useful
+half below — nothing yet says which direct dependency pulled one in. A Conan 2
+lockfile is a flat list with no edges, so that needs either the Conan 1 node
+graph, Trivy's `DependsOn` (absent from the version measured), or a resolve.
 
 What stays ours, because no SCA tool answers it: **"we do not call this, but our
 dependency does."** A transitive dependency has no call sites of ours by
@@ -824,12 +928,13 @@ Ordered; each is independently shippable.
 4. **Ship the Python API-surface diff** — `ast` over sdists/wheels from PyPI, the
    direct analogue of the header diff and the reason the judgement layer has
    anything factual to say about Python. (Item 2b.)
-5. **Add a Trivy discovery source** — single static binary, keeps
+5. ~~**Add a Trivy discovery source**~~ — *shipped in 0.5.0.* Single static binary, keeps
    `[project.dependencies]` empty, brings transitive resolution and `uv`
    coverage. Merge additively with the native parsers, exactly as the analysis
    backends merge. (Item 7.)
-6. **Mark ingested dependencies report-only** and make `apply` refuse them rather
-   than guess an edit. Ship with step 5, not after it. (Item 7.)
+6. ~~**Mark ingested dependencies report-only**~~ — *shipped in 0.5.0*, and it fell
+   out of the model rather than needing a special case: no line number means no
+   editable declaration, and `apply` refuses those. (Item 7.)
 7. **Consider dependabot-cli later, and only for update-checking** — its
    `update_checker` per ecosystem is better than anything reasonable to write
    here, but it is Ruby in Docker, so it stays optional and never a requirement.

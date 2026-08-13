@@ -31,7 +31,7 @@ import sys
 from datetime import date
 
 from . import apply as apply_mod
-from . import apidiff, backends, companion, discover, profile, upstream
+from . import apidiff, backends, companion, discover, profile, sources, upstream
 from .fingerprint import compare
 from .model import Dep
 
@@ -163,13 +163,15 @@ def _emit(obj, as_json: bool, human) -> None:
         human(obj)
 
 
-def _build_profile(root: str, prefer_backend: str = "") -> tuple[list[Dep], dict]:
-    deps, manifests = discover.discover(root)
+def _build_profile(root: str, prefer_backend: str = "",
+                   ingest: bool = True) -> tuple[list[Dep], dict]:
+    deps, manifests = discover.discover(root, ingest=ingest)
     used = backends.analyse(root, deps, force=prefer_backend)
     meta = {
         "repo": os.path.basename(os.path.abspath(root)),
         "generated": date.today().isoformat(),
         "backend": used,
+        "sources": sources.describe(root) if ingest else "native",
         "manifests": manifests,
     }
     return deps, meta
@@ -181,7 +183,7 @@ def _build_profile(root: str, prefer_backend: str = "") -> tuple[list[Dep], dict
 def cmd_profile(args) -> int:
     """Regenerate CLAUDE_DEPS.md from the repository."""
     root = args.root
-    fresh, meta = _build_profile(root, args.backend)
+    fresh, meta = _build_profile(root, args.backend, args.ingest)
 
     old, old_meta = profile.load(root)
     if old and not args.force:
@@ -234,7 +236,7 @@ def cmd_status(args) -> int:
         return 0
 
     stored, meta = profile.load(root)
-    fresh, _ = discover.discover(root)
+    fresh, _ = discover.discover(root, ingest=args.ingest)
     stored_by = {d.name: d for d in stored}
     fresh_by = {d.name: d for d in fresh}
 
@@ -287,7 +289,7 @@ def cmd_check(args) -> int:
     root = args.root
     deps, meta = (profile.load(root) if profile.exists(root) else ([], {}))
     if not deps:
-        deps, meta = _build_profile(root, args.backend)
+        deps, meta = _build_profile(root, args.backend, args.ingest)
 
     if args.only:
         wanted = {n.strip().lower() for n in args.only.split(",")}
@@ -427,7 +429,7 @@ def cmd_check(args) -> int:
 
 def cmd_apidiff(args) -> int:
     """Diff one dependency's public headers between two versions."""
-    dep = _find_dep(args.root, args.dep)
+    dep = _find_dep(args.root, args.dep, args.ingest)
     if not dep.consumed:
         # Without a consumed surface there is nothing to intersect against, and
         # a bare list of upstream removals is what a changelog already is.
@@ -466,10 +468,10 @@ def cmd_apidiff(args) -> int:
     return 0
 
 
-def _find_dep(root: str, name: str) -> Dep:
+def _find_dep(root: str, name: str, ingest: bool = True) -> Dep:
     deps, _ = profile.load(root)
     if not deps:
-        deps, _ = discover.discover(root)
+        deps, _ = discover.discover(root, ingest=ingest)
     want = name.lower()
     for d in deps:
         # Aliases matter: after reconciliation `find_package(CURL)` and
@@ -489,7 +491,7 @@ def _strip_private(planned: dict) -> dict:
 
 
 def cmd_plan(args) -> int:
-    dep = _find_dep(args.root, args.dep)
+    dep = _find_dep(args.root, args.dep, args.ingest)
     companions = [] if args.ignore_companions else _resolve_companions(dep, args.to)
     try:
         planned = apply_mod.plan(args.root, dep, args.to, companions=companions)
@@ -509,6 +511,10 @@ def cmd_plan(args) -> int:
             print("coupled pin(s) NOT resolved (--ignore-companions) —")
             for c in r["companion_pins"]:
                 print(f"  {c}")
+        if r.get("regenerate"):
+            print("still records the old version, and is not ours to edit: "
+                  + "; ".join(r["regenerate"]))
+            print("  regenerate it, or the build keeps resolving the old pin.")
         if r["blocked_on"]:
             print("WARNING: apply would refuse — unresolved coupled pin(s): "
                   + "; ".join(r["blocked_on"]))
@@ -520,7 +526,7 @@ def cmd_plan(args) -> int:
 
 
 def cmd_apply(args) -> int:
-    dep = _find_dep(args.root, args.dep)
+    dep = _find_dep(args.root, args.dep, args.ingest)
     companions = [] if args.ignore_companions else _resolve_companions(dep, args.to)
     try:
         planned = apply_mod.plan(args.root, dep, args.to, companions=companions)
@@ -601,6 +607,9 @@ def cmd_apply(args) -> int:
                 print(f"    {c['evidence']}")
             for note in c.get("notes") or []:
                 print(f"    ! {note}")
+        for where in r.get("regenerate") or []:
+            print(f"  ! {where} still records the old version and was left alone — "
+                  f"regenerate it, or the build keeps resolving the old pin")
         if sandbox_note:
             print(f"  {sandbox_note}")
         print(f"  backups kept outside your tree in {r['backup_dir']} "
@@ -618,7 +627,7 @@ def cmd_apply(args) -> int:
 
 
 def cmd_revert(args) -> int:
-    dep = _find_dep(args.root, args.dep)
+    dep = _find_dep(args.root, args.dep, args.ingest)
     # An apply may have touched a second file, if the coupled pin lives
     # elsewhere. Restore every file this dependency could have edited.
     rels = [dep.declared_in.split(":")[0]]
@@ -647,12 +656,18 @@ def main(argv: list[str] | None = None) -> int:
                         help="repository root (default: cwd)")
     common.add_argument("--json", dest="json_sub", action="store_true",
                         help="machine-readable output")
+    common.add_argument("--no-ingest", dest="no_ingest_sub", action="store_true",
+                        default=None,
+                        help="use only the native parsers, ignoring any installed "
+                             f"scanner ({', '.join(sources.NAMES)})")
 
     p = argparse.ArgumentParser(prog="deptool", description=__doc__)
     p.add_argument("--root", dest="root_top", default=".",
                    help="repository root (default: cwd)")
     p.add_argument("--json", dest="json_top", action="store_true",
                    help="machine-readable output")
+    p.add_argument("--no-ingest", dest="no_ingest_top", action="store_true",
+                   help="use only the native parsers")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("profile", help="regenerate CLAUDE_DEPS.md", parents=[common])
@@ -725,6 +740,7 @@ def main(argv: list[str] | None = None) -> int:
         args.root_sub if args.root_sub is not None else args.root_top
     )
     args.json = bool(args.json_sub or args.json_top)
+    args.ingest = not (args.no_ingest_sub or args.no_ingest_top)
     if not hasattr(args, "backend"):
         args.backend = ""
     return args.func(args)

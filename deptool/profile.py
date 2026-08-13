@@ -46,6 +46,10 @@ def render(deps: list[Dep], root: str, meta: dict) -> str:
         f"- repo: {meta.get('repo', os.path.basename(os.path.abspath(root)))}",
         f"- generated: {meta.get('generated', date.today().isoformat())}",
         f"- backend: {meta.get('backend', 'builtin')}",
+        # Which discovery sources produced this list. It belongs in the file
+        # because "no dependencies here" means something different when only
+        # the native parsers ran.
+        f"- sources: {meta.get('sources', 'native')}",
         f"- manifests: {', '.join(meta.get('manifests', []))}",
         f"- deps: {len(deps)}",
         "",
@@ -146,6 +150,7 @@ def parse(text: str) -> tuple[list[Dep], dict]:
             im = _ITEM.match(line)
             if im and current_list:
                 _append(dep, current_list, im.group(1).strip())
+        dep.ensure_declaration()
         deps.append(dep)
     return deps, meta
 

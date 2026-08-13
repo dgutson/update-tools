@@ -5,6 +5,7 @@ scope misclassification (a test-only dep reported as production risk), and the
 version-swap regex (a bad edit corrupts CMakeLists.txt).
 """
 
+import json
 import os
 import shutil
 import sys
@@ -2466,7 +2467,7 @@ def test_a_failed_verification_leaves_the_tree_untouched(tmp_path, monkeypatch, 
     repo = tmp_path / "repo"
     repo.mkdir()
     dep = _pinned_repo(repo)
-    monkeypatch.setattr("deptool.__main__._find_dep", lambda root, name: dep)
+    monkeypatch.setattr("deptool.__main__._find_dep", lambda root, name, ingest=True: dep)
     monkeypatch.setattr("deptool.__main__._resolve_companions", lambda d, to: [])
 
     seen: dict = {}
@@ -2500,7 +2501,7 @@ def test_a_passing_verification_then_writes_the_bump(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     dep = _pinned_repo(repo)
-    monkeypatch.setattr("deptool.__main__._find_dep", lambda root, name: dep)
+    monkeypatch.setattr("deptool.__main__._find_dep", lambda root, name, ingest=True: dep)
     monkeypatch.setattr("deptool.__main__._resolve_companions", lambda d, to: [])
     monkeypatch.setattr(apply_mod, "verify", lambda root, build_dir="build": [
         {"cmd": "cmake --build", "ok": True, "output": ""}
@@ -2526,3 +2527,369 @@ def test_missing_toolchain_is_not_a_pass(tmp_path, monkeypatch, capsys):
     checked = apply_mod.verify_plan(str(repo), planned)
     assert checked["ok"] is True          # nothing failed ...
     assert checked["established"] is False  # ... but nothing was shown either
+
+
+# ------------------------------------------------- the lockfile's separate truth
+
+
+def _locked_repo(tmp_path, locked_zlib="1.3", extra=""):
+    """A repo where the lockfile and the manifest were resolved at different
+    times — the shape finding C describes."""
+    root = tmp_path / "repo"
+    (root / "deps").mkdir(parents=True)
+    (root / "deps" / "conanfile.txt").write_text(
+        "[requires]\nzlib/1.3.1\nlibcurl/8.4.0\n\n[build_requires]\ncmake/3.28.1\n"
+    )
+    (root / "conan.lock").write_text(
+        json.dumps(
+            {
+                "version": "0.5",
+                "requires": [
+                    f"zlib/{locked_zlib}#5c0f3a1a222eebb6bff34980bcd3e024%1705999193.7",
+                    "libcurl/8.4.0#75a58bcdba79d1a39ff0226cc2955c83%1726198020.146",
+                    "zstd/1.5.5#1f239731dc45147c7fc2f54bfbde73df%1715599909.17",
+                ],
+                "build_requires": [
+                    "pkgconf/2.1.0#27f44583701117b571307cf5b5fe5605%1701537936.4",
+                    "pkgconf/2.0.3#f996677e96e61e6552d85e83756c328b%1696606182.2",
+                ],
+            },
+            indent=4,
+        )
+        + extra
+    )
+    return str(root)
+
+
+def test_the_lockfile_is_read_as_a_declaration_site(tmp_path):
+    from deptool import discover
+
+    deps, files = discover.discover(_locked_repo(tmp_path))
+    assert "conan.lock" in files
+    curl = next(d for d in deps if d.name == "libcurl")
+    kinds = {d.kind for d in curl.declarations}
+    assert kinds == {"conan", "conan-lock"}
+    lock = next(d for d in curl.declarations if d.kind == "conan-lock")
+    assert lock.line == 5  # positions survive, though json.load discards them
+    assert lock.raw_pin.endswith("%1726198020.146")  # revision kept verbatim
+
+
+def test_a_stale_lock_is_a_finding_of_its_own(tmp_path):
+    """Not the same finding as two manifests disagreeing: the edit is still well
+    defined, so this must not read as "reconcile the manifests first"."""
+    from deptool import discover
+
+    deps, _ = discover.discover(_locked_repo(tmp_path))
+    zlib = next(d for d in deps if d.name == "zlib")
+    assert zlib.lock_drift() == {"1.3": ["conan.lock:4"]}
+    assert not zlib.diverges()
+    assert "stale or the build is not using it" in zlib.divergence_note()
+
+
+def test_a_lock_that_agrees_with_the_manifest_says_nothing(tmp_path):
+    from deptool import discover
+
+    deps, _ = discover.discover(_locked_repo(tmp_path, locked_zlib="1.3.1"))
+    zlib = next(d for d in deps if d.name == "zlib")
+    assert zlib.lock_drift() == {}
+    assert zlib.divergence_note() == ""
+
+
+def test_a_lock_only_dependency_is_transitive_not_drifted(tmp_path):
+    """Nothing for it to disagree with, and an empty usage profile is expected
+    rather than evidence that it is unused."""
+    from deptool import discover
+
+    deps, _ = discover.discover(_locked_repo(tmp_path))
+    zstd = next(d for d in deps if d.name == "zstd")
+    assert zstd.lock_drift() == {}
+    assert any("transitive" in n for n in zstd.notes)
+    assert not any("stale" in n for n in zstd.notes)
+
+
+def test_one_package_locked_twice_keeps_both(tmp_path):
+    """Conan permits it — two profiles resolving one build requirement
+    differently — so the parser must not assume uniqueness."""
+    from deptool import discover
+
+    deps, _ = discover.discover(_locked_repo(tmp_path))
+    pkgconf = next(d for d in deps if d.name == "pkgconf")
+    assert pkgconf.pin_variants() == {
+        "2.0.3": ["conan.lock:10"],
+        "2.1.0": ["conan.lock:9"],
+    }
+    assert "more than one version at once" in pkgconf.divergence_note()
+
+
+def test_build_requirements_are_not_runtime_risk(tmp_path):
+    from deptool import discover
+
+    deps, _ = discover.discover(_locked_repo(tmp_path))
+    assert next(d for d in deps if d.name == "pkgconf").scope == "build"
+    assert next(d for d in deps if d.name == "zstd").scope == "runtime"
+
+
+def test_a_conan_1_lock_is_read_too(tmp_path):
+    from deptool import discover
+
+    root = tmp_path / "v1"
+    root.mkdir()
+    (root / "conan.lock").write_text(
+        json.dumps(
+            {
+                "graph_lock": {
+                    "nodes": {
+                        "0": {"path": "conanfile.txt", "requires": ["1"],
+                              "build_requires": ["2"]},
+                        "1": {"ref": "zlib/1.2.13#abc", "requires": []},
+                        "2": {"ref": "ninja/1.11.1#def"},
+                    }
+                },
+                "version": "0.4",
+            },
+            indent=2,
+        )
+    )
+    deps, _ = discover.discover(str(root))
+    got = {d.name: (d.version, d.scope) for d in deps}
+    assert got == {"zlib": ("1.2.13", "runtime"), "ninja": ("1.11.1", "build")}
+
+
+def test_apply_refuses_to_hand_edit_a_lockfile(tmp_path):
+    """A lockfile line has a version and a position and is still not ours to
+    edit: the version sits beside the revision it was resolved with."""
+    from deptool import apply as apply_mod
+    from deptool import discover
+
+    root = _locked_repo(tmp_path)
+    deps, _ = discover.discover(root)
+    zstd = next(d for d in deps if d.name == "zstd")
+    with pytest.raises(apply_mod.ApplyError) as exc:
+        apply_mod.plan(root, zstd, "1.5.6")
+    assert "report-only" in str(exc.value)
+
+
+def test_a_bump_says_which_generated_file_it_left_behind(tmp_path):
+    """Editing the manifest and saying nothing about the lock produces a bump
+    that changes the declaration and not the build."""
+    from deptool import apply as apply_mod
+    from deptool import discover
+
+    root = _locked_repo(tmp_path)
+    deps, _ = discover.discover(root)
+    curl = next(d for d in deps if d.name == "libcurl")
+    planned = apply_mod.plan(root, curl, "8.21.0")
+    assert planned["file"] == "deps/conanfile.txt"
+    assert planned["regenerate"] == ["conan.lock:5"]
+    assert "conan.lock" not in planned["diff"]
+
+
+def test_a_lockfile_pin_never_wins_the_editable_site(tmp_path):
+    from deptool import discover
+
+    deps, _ = discover.discover(_locked_repo(tmp_path))
+    zlib = next(d for d in deps if d.name == "zlib")
+    assert zlib.declared_in == "deps/conanfile.txt:2"
+    assert [d.is_editable() for d in zlib.declarations] == [False, True]
+
+
+# ----------------------------------------------------------- ingesting a scanner
+
+
+def _fake_trivy(monkeypatch, report, rc=0, calls=None):
+    """Stand in for the binary. The real one cannot be used here: tmp_path lives
+    under /tmp, which a snap-confined trivy cannot see at all."""
+    import subprocess
+
+    from deptool import sources
+
+    # conftest turns the ingest off for the whole suite; these tests are the
+    # ones that turn it back on, against this fake rather than a real install.
+    monkeypatch.setattr(sources, "detect", lambda root: ["trivy"])
+
+    def fake_run(cmd, **kwargs):
+        if calls is not None:
+            calls.append(cmd)
+        code = rc(cmd) if callable(rc) else rc
+        return subprocess.CompletedProcess(
+            cmd, code, stdout="" if code else json.dumps(report), stderr=""
+        )
+
+    monkeypatch.setattr(sources.subprocess, "run", fake_run)
+
+
+def _report(target, eco, packages):
+    return {"Results": [{"Target": target, "Class": "lang-pkgs",
+                         "Type": eco, "Packages": packages}]}
+
+
+def test_an_ingested_ecosystem_we_cannot_parse_is_still_reported(tmp_path):
+    """The whole point of the ingest: an ecosystem with no native parser is
+    invisible today, and invisible is the failure this tool exists to prevent."""
+    from deptool import discover
+
+    (tmp_path / "packages.config").write_text("<packages/>\n")
+    with pytest.MonkeyPatch.context() as mp:
+        _fake_trivy(mp, _report("packages.config", "nuget", [
+            {"Name": "Newtonsoft.Json", "Version": "13.0.3"},
+        ]))
+        deps, files = discover.discover(str(tmp_path))
+    pkg = next(d for d in deps if d.name == "Newtonsoft.Json")
+    assert pkg.version == "13.0.3"
+    assert pkg.kind == "nuget"
+    assert "packages.config" in files
+
+
+def test_an_ingested_dependency_without_a_line_is_report_only(tmp_path):
+    from deptool import apply as apply_mod
+    from deptool import discover
+
+    (tmp_path / "packages.config").write_text("<packages/>\n")
+    with pytest.MonkeyPatch.context() as mp:
+        _fake_trivy(mp, _report("packages.config", "nuget", [
+            {"Name": "Moq", "Version": "4.7.0"},
+        ]))
+        deps, _ = discover.discover(str(tmp_path))
+    moq = next(d for d in deps if d.name == "Moq")
+    assert not any(d.is_editable() for d in moq.declarations)
+    assert any("report-only" in n for n in moq.notes)
+    with pytest.raises(apply_mod.ApplyError) as exc:
+        apply_mod.plan(str(tmp_path), moq, "4.8.0")
+    assert "report-only" in str(exc.value)
+
+
+def test_an_ingested_package_merges_with_the_native_one(tmp_path):
+    """Additive, not either/or: one record, the native line still the editable
+    site, and the duplicate declaration collapses instead of doubling."""
+    from deptool import discover
+
+    root = _locked_repo(tmp_path)
+    with pytest.MonkeyPatch.context() as mp:
+        _fake_trivy(mp, _report("conan.lock", "conan", [
+            {"Name": "zlib", "Version": "1.3",
+             "Locations": [{"StartLine": 4, "EndLine": 4}]},
+        ]))
+        deps, _ = discover.discover(root)
+    zlib = [d for d in deps if d.name == "zlib"]
+    assert len(zlib) == 1
+    assert [d.where() for d in zlib[0].declarations] == [
+        "conan.lock:4", "deps/conanfile.txt:2",
+    ]
+    assert zlib[0].declared_in == "deps/conanfile.txt:2"
+
+
+def test_an_ingested_package_does_not_merge_across_ecosystems(tmp_path):
+    """A NuGet package and a C library that happen to share a name are not the
+    same artefact, and merging them would invent a fact."""
+    from deptool import discover
+
+    (tmp_path / "conanfile.txt").write_text("[requires]\nzlib/1.3.1\n")
+    (tmp_path / "packages.config").write_text("<packages/>\n")
+    with pytest.MonkeyPatch.context() as mp:
+        _fake_trivy(mp, _report("packages.config", "nuget", [
+            {"Name": "zlib", "Version": "9.9.9"},
+        ]))
+        deps, _ = discover.discover(str(tmp_path))
+    assert sorted((d.kind, d.version) for d in deps if d.name == "zlib") == [
+        ("conan", "1.3.1"), ("nuget", "9.9.9"),
+    ]
+
+
+def test_the_fast_offline_invocation_is_tried_first(tmp_path):
+    """Secret scanning found the same packages and took seven times as long, so
+    it is the fallback for a trivy whose database has never been downloaded."""
+    from deptool import sources
+
+    calls = []
+    with pytest.MonkeyPatch.context() as mp:
+        _fake_trivy(mp, _report("requirements.txt", "pip", []), calls=calls)
+        sources.ingest(str(tmp_path))
+    assert "--skip-db-update" in calls[0] and "vuln" in calls[0]
+    assert len(calls) == 1  # the fallback is not run when the first attempt works
+
+
+def test_a_trivy_with_no_database_falls_back_instead_of_downloading_one(tmp_path):
+    from deptool import sources
+
+    calls = []
+    with pytest.MonkeyPatch.context() as mp:
+        _fake_trivy(
+            mp, _report("requirements.txt", "pip",
+                        [{"Name": "requests", "Version": "2.31.0"}]),
+            rc=lambda cmd: 1 if "--skip-db-update" in cmd else 0,
+            calls=calls,
+        )
+        deps, _ = sources.ingest(str(tmp_path))
+    assert [d.name for d in deps] == ["requests"]
+    assert "--skip-db-update" not in calls[1] and "secret" in calls[1]
+
+
+def test_a_broken_scanner_is_silence_not_an_error(tmp_path):
+    """It has to work with nothing installed, so a scanner that fails is a
+    source that contributed nothing — never a failed run."""
+    from deptool import discover, sources
+
+    (tmp_path / "conanfile.txt").write_text("[requires]\nzlib/1.3.1\n")
+    with pytest.MonkeyPatch.context() as mp:
+        _fake_trivy(mp, {}, rc=2)
+        assert sources.ingest(str(tmp_path)) == ([], [])
+        deps, _ = discover.discover(str(tmp_path))
+    assert [d.name for d in deps] == ["zlib"]
+
+
+def test_os_packages_are_not_this_projects_dependencies(tmp_path):
+    """They describe the machine trivy ran on, not anything declared here."""
+    from deptool import sources
+
+    with pytest.MonkeyPatch.context() as mp:
+        _fake_trivy(mp, {"Results": [
+            {"Target": "OS Packages", "Class": "os-pkgs", "Type": "debian",
+             "Packages": [{"Name": "libc6", "Version": "2.39"}]},
+        ]})
+        assert sources.ingest(str(tmp_path)) == ([], [])
+
+
+def test_no_ingest_uses_only_the_native_parsers(tmp_path):
+    from deptool import discover
+
+    (tmp_path / "packages.config").write_text("<packages/>\n")
+    with pytest.MonkeyPatch.context() as mp:
+        _fake_trivy(mp, _report("packages.config", "nuget", [
+            {"Name": "Moq", "Version": "4.7.0"},
+        ]))
+        assert discover.discover(str(tmp_path), ingest=False) == ([], [])
+
+
+def test_a_lockfile_stays_uneditable_across_the_profile_file(tmp_path):
+    """`_find_dep` reads dependencies back out of CLAUDE_DEPS.md, so the fact
+    that a declaration is generated has to survive the round trip — otherwise a
+    reload is all it takes for `apply` to start editing a lockfile."""
+    from deptool import apply as apply_mod
+    from deptool import discover, profile
+
+    root = _locked_repo(tmp_path)
+    deps, _ = discover.discover(root)
+    profile.save(root, deps, {"repo": "r", "generated": "2026-01-01"})
+    loaded, _ = profile.load(root)
+
+    zstd = next(d for d in loaded if d.name == "zstd")
+    assert [d.kind for d in zstd.declarations] == ["conan-lock"]
+    assert not any(d.is_editable() for d in zstd.declarations)
+    with pytest.raises(apply_mod.ApplyError):
+        apply_mod.plan(root, zstd, "1.5.6")
+
+    curl = next(d for d in loaded if d.name == "libcurl")
+    assert apply_mod.plan(root, curl, "8.21.0")["regenerate"] == ["conan.lock:5"]
+
+
+def test_an_unpinned_system_dependency_still_gets_its_own_message(tmp_path):
+    """It has no editable declaration either, but "report-only" would be the
+    wrong advice: the fix is the CI image, not a hand edit."""
+    from deptool import apply as apply_mod
+    from deptool.model import Dep
+
+    (tmp_path / "CMakeLists.txt").write_text("find_package(ALSA REQUIRED)\n")
+    dep = Dep(name="ALSA", kind="pkg-config", declared_in="CMakeLists.txt:1")
+    with pytest.raises(apply_mod.ApplyError) as exc:
+        apply_mod.plan(str(tmp_path), dep, "1.2.11")
+    assert "system dependency" in str(exc.value)

@@ -162,6 +162,26 @@ and deepening the disagreement. The fix is to reconcile the manifests first;
 that is the recommendation to make, and it is usually a one-line edit rather
 than an upgrade.
 
+**A lockfile disagreeing with the manifest is a different finding, and does not
+block a bump.** The `divergence` text says so ("either the lock is stale or the
+build is not using it"). Treat it as a fact about what is *actually built*: every
+other claim about that dependency — the advisory match, the header diff — is
+about the version the manifest asks for, while the locked one is what ships.
+Recommend regenerating the lock, never editing it; `apply` will not touch a
+generated file, and after a bump it reports which ones still record the old
+version.
+
+### Two notes that change what a finding means
+
+- **`transitive`** — only a lockfile or an ingested scanner records this
+  dependency; no manifest declares it. It has no call sites of yours by
+  definition, so an empty `consumed` list here means "we do not call it
+  directly", **not** "it is unused". Never recommend dropping one on that basis.
+  The actionable advice is about whatever pulls it in.
+- **`report-only`** — the dependency was found without a line number, so
+  `/deps:apply` will refuse it and say so. Judge and report it exactly like any
+  other; just make the recommended action a hand edit rather than an apply.
+
 ### Read `change_evidence` before the release notes
 
 For a C/C++ dependency with a readable GitHub upstream, the tool has already

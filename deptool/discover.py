@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import tomllib
 
-from . import cmake
+from . import cmake, sources
 from .model import Declaration, Dep, Upstream, most_restrictive, parse_version
 
 MANIFESTS = {
@@ -31,6 +31,7 @@ MANIFESTS = {
     "go.mod": "gomod",
     "conanfile.txt": "conan",
     "conanfile.py": "conan",
+    "conan.lock": "conan",
     "vcpkg.json": "vcpkg",
 }
 
@@ -325,6 +326,135 @@ def _conan_py(root: str, rel: str) -> list[Dep]:
     return deps
 
 
+# A Conan reference: name/version[@user/channel][#recipe-revision][%timestamp].
+_CONAN_REF = re.compile(
+    r"^(?P<name>[\w.+-]+)/(?P<version>[^@#%/\s]+)"
+    r"(?:@(?P<user>[\w.+-]+)/(?P<channel>[\w.+-]+))?"
+    r"(?:#(?P<revision>[^%\s]+))?"
+    r"(?:%(?P<timestamp>[\d.]+))?$"
+)
+
+# Which lockfile list a reference came from, and what that makes it. Build
+# tooling reported as runtime risk is noise, and the lockfile is the only file
+# that draws the distinction for the resolved set.
+_LOCK_SECTIONS = {
+    "requires": "runtime",
+    "build_requires": "build",
+    "python_requires": "build",
+    "config_requires": "build",
+}
+
+
+def _line_finder(text: str):
+    """Locate each reference in the raw text, in document order.
+
+    `json.load` discards positions, and a resolved version with no position is
+    a fact nobody can go and look at. Scanning forward from the last match
+    keeps the two occurrences of a package locked at two versions on their own
+    lines instead of collapsing onto the first.
+    """
+    lines = text.splitlines()
+    cursor = 0
+
+    def find(needle: str) -> int:
+        nonlocal cursor
+        for i in range(cursor, len(lines)):
+            if needle in lines[i]:
+                cursor = i + 1
+                return i + 1
+        # Reformatted, or a shape whose document order is not ours: a
+        # slightly-off line beats no line, since nothing edits this file.
+        for i, line in enumerate(lines, 1):
+            if needle in line:
+                return i
+        return 0
+
+    return find
+
+
+def _lock_dep(ref: str, scope: str, rel: str, find_line) -> Dep | None:
+    ref = str(ref).strip()
+    m = _CONAN_REF.match(ref)
+    if not m:
+        return None
+    name = m.group("name")
+    line = find_line(ref)
+    # The recipe revision stays in `raw_pin` verbatim rather than becoming a
+    # note: it is the fact that makes "locally patched" checkable later, and
+    # repeating it in prose would say nothing the reference does not.
+    return Dep(
+        name=name,
+        kind="conan-lock",
+        version=m.group("version"),
+        raw_pin=ref,
+        declared_in=f"{rel}:{line}" if line else rel,
+        scope=scope,
+        upstream=Upstream(kind="conan", ref=name),
+    )
+
+
+def _conan_lock(root: str, rel: str) -> list[Dep]:
+    """Every version a Conan lockfile actually resolved.
+
+    The lockfile answers a different question from the manifest beside it — not
+    "what do we ask for" but "what did resolution actually pick" — and the two
+    disagree more often than anyone expects. That disagreement is a finding no
+    upstream lookup produces, because both files are already here.
+
+    It is also the only file naming the *transitive* set (a compression
+    library, an iconv implementation) that no conanfile mentions and that is
+    real attack surface, and the only one separating build-only requirements so
+    build tooling is not reported as runtime risk.
+
+    Conan 2 writes flat lists; Conan 1 writes a `graph_lock.nodes` object. Both
+    are read. The format permits the same package twice at two versions — a
+    build requirement resolved differently for two profiles — so nothing here
+    assumes uniqueness: reconciliation turns the duplicate into a divergence
+    finding rather than dropping one of them.
+    """
+    try:
+        text = open(os.path.join(root, rel), encoding="utf-8", errors="replace").read()
+        data = json.loads(text)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+
+    find_line = _line_finder(text)
+    deps: list[Dep] = []
+
+    for section, scope in _LOCK_SECTIONS.items():
+        for entry in data.get(section) or []:
+            if not isinstance(entry, str):
+                continue
+            dep = _lock_dep(entry, scope, rel, find_line)
+            if dep:
+                deps.append(dep)
+
+    # Conan 1: nodes keyed by id, and a node is build-only when some other node
+    # lists it under `build_requires`.
+    nodes = (data.get("graph_lock") or {}).get("nodes") or {}
+    if isinstance(nodes, dict):
+        build_ids = {
+            str(i)
+            for n in nodes.values()
+            if isinstance(n, dict)
+            for i in (n.get("build_requires") or [])
+        }
+        for nid, node in nodes.items():
+            if not isinstance(node, dict) or node.get("path"):
+                continue  # `path` marks the consumer itself, not a dependency
+            dep = _lock_dep(
+                node.get("ref") or "",
+                "build" if str(nid) in build_ids else "runtime",
+                rel,
+                find_line,
+            )
+            if dep:
+                deps.append(dep)
+    return deps
+
+
 # Per-manifest parsers, keyed by basename. Each takes (root, path relative to
 # root) so a manifest found anywhere in the tree is parsed the same way.
 _PARSERS = {
@@ -335,6 +465,7 @@ _PARSERS = {
     "go.mod": _gomod,
     "conanfile.txt": _conan_txt,
     "conanfile.py": _conan_py,
+    "conan.lock": _conan_lock,
     "vcpkg.json": _vcpkg,
 }
 
@@ -451,28 +582,24 @@ def canonical_name(name: str) -> str:
 # not the same artefact, whereas `find_package(ZLIB)` and Conan's `zlib` are.
 _FAMILY = {"npm": "npm", "cargo": "cargo", "pypi": "pypi", "gomod": "gomod"}
 
+# The kinds that all name the same C/C++ artefact from different angles — a
+# build-system lookup, a package-manager pin, a lockfile line.
+_NATIVE = {"conan", "conan-lock", "vcpkg", "pkg-config", "distro"}
+
 
 def _family(kind: str) -> str:
-    return _FAMILY.get(kind, "native")
+    """The namespace `kind` names things in.
 
-
-def _split_site(declared_in: str) -> tuple[str, int]:
-    """Split `path:line`, `path (table)` or `path` into (path, line)."""
-    text = (declared_in or "").strip()
-    if not text:
-        return "", 0
-    head = text.split(" (")[0].strip()
-    path, _, lpart = head.rpartition(":")
-    if path and lpart.isdigit():
-        return path, int(lpart)
-    return head, 0
-
-
-def _declaration_of(dep: Dep) -> Declaration:
-    path, line = _split_site(dep.declared_in)
-    return Declaration(
-        path=path, line=line, kind=dep.kind, version=dep.version, raw_pin=dep.raw_pin
-    )
+    An ingested ecosystem this tool has no parser for (`nuget`, `pom`) is its
+    own namespace by default rather than being lumped in with the C libraries.
+    Guessing that a NuGet package and a `find_package` result are the same
+    library because they share a name is how a merge invents a fact.
+    """
+    if kind in _FAMILY:
+        return _FAMILY[kind]
+    if kind in _NATIVE or kind.startswith("cmake-"):
+        return "native"
+    return kind or "native"
 
 
 def _pin_rank(d: Declaration) -> int:
@@ -516,8 +643,7 @@ def reconcile(deps: list[Dep]) -> list[Dep]:
     every name it was declared under, and the merge only ever adds facts.
     """
     for dep in deps:
-        if not dep.declarations:
-            dep.declarations = [_declaration_of(dep)]
+        dep.ensure_declaration()
 
     groups: dict[tuple[str, str], list[Dep]] = {}
     for dep in deps:
@@ -526,8 +652,27 @@ def reconcile(deps: list[Dep]) -> list[Dep]:
     out: list[Dep] = []
     for key in dict.fromkeys((_family(d.kind), canonical_name(d.name)) for d in deps):
         group = groups[key]
-        out.append(group[0] if len(group) == 1 else _fold(group))
+        dep = group[0] if len(group) == 1 else _fold(group)
+        _note_if_transitive(dep)
+        out.append(dep)
     return out
+
+
+def _note_if_transitive(dep: Dep) -> None:
+    """Say so when a lockfile is the only thing that mentions a dependency.
+
+    It ships, it carries CVEs, and no manifest names it. The note matters
+    because the usage profile for such a dependency is empty *by construction*
+    — our code does not call it directly, something we do depend on pulled it
+    in — and an empty profile read as "unused" is the confidently-wrong answer
+    this tool exists to avoid.
+    """
+    if not dep.declarations or not all(d.is_generated() for d in dep.declarations):
+        return
+    dep.notes.append(
+        "transitive — only the lockfile records it, so an empty usage profile "
+        "means our own code does not call it directly, not that it is unused"
+    )
 
 
 def _rank_of(dep: Dep) -> tuple[int, int]:
@@ -588,14 +733,14 @@ def _fold(group: list[Dep]) -> Dep:
     if keep.aliases:
         keep.notes.append("also declared as " + ", ".join(keep.aliases))
     if any(k.startswith("cmake-") or k == "pkg-config" for k in kinds) and (
-        kinds & {"conan", "vcpkg"}
+        kinds & {"conan", "conan-lock", "vcpkg"}
     ):
         keep.notes.append(
             "declared to the build system under one name and pinned by the package "
             "manager under another — the package manager decides the version, so a "
             "system-library comparison would be the wrong answer here"
         )
-    if keep.diverges():
+    if keep.divergence_note():
         keep.notes.append(keep.divergence_note())
     editable = [x for x in keep.declarations if x.is_editable()]
     if len(editable) > 1:
@@ -606,8 +751,14 @@ def _fold(group: list[Dep]) -> Dep:
     return keep
 
 
-def discover(root: str) -> tuple[list[Dep], list[str]]:
-    """Return (deps, files_that_declare_them)."""
+def discover(root: str, ingest: bool = True) -> tuple[list[Dep], list[str]]:
+    """Return (deps, files_that_declare_them).
+
+    `ingest` runs whatever external scanner is installed as an additional
+    source (see `sources`). It is on by default because a dependency nobody can
+    see is the failure this tool exists to prevent, and off is a flag away for
+    when the scanner is slow, wrong, or simply not wanted.
+    """
     deps: list[Dep] = []
     files: list[str] = []
 
@@ -645,6 +796,13 @@ def discover(root: str) -> tuple[list[Dep], list[str]]:
         # read (a Poetry pyproject, today) must not look like a project with no
         # dependencies.
         files.append(rel)
+
+    # Ingested last, so a native declaration — the one with a line number `apply`
+    # can edit — is already present when the two reconcile.
+    if ingest:
+        ingested, ingested_files = sources.ingest(root)
+        deps += ingested
+        files += ingested_files
 
     probe_installed(deps)
 

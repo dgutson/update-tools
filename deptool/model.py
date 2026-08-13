@@ -119,6 +119,14 @@ class CompanionPin:
         )
 
 
+# Kinds that record a *resolved* fact rather than a hand-written declaration.
+# A lockfile pin has a perfectly good file and line, but it is generated: the
+# version sits beside the recipe revision it was resolved with, so hand-editing
+# one desynchronises the pair. The edit belongs in the manifest and the
+# regeneration belongs to the package manager.
+GENERATED_KINDS = {"conan-lock"}
+
+
 @dataclass
 class Declaration:
     """One place a dependency is declared, and what that place says.
@@ -147,9 +155,14 @@ class Declaration:
     def where(self) -> str:
         return f"{self.path}:{self.line}" if self.line else self.path
 
+    def is_generated(self) -> bool:
+        """Was this written by a tool rather than by a person?"""
+        return self.kind in GENERATED_KINDS
+
     def is_editable(self) -> bool:
-        """Can `apply` rewrite this pin? Needs a version *and* a position."""
-        return bool(self.version and self.path and self.line)
+        """Can `apply` rewrite this pin? Needs a version *and* a position, and
+        the file has to be one a human maintains — see `GENERATED_KINDS`."""
+        return bool(self.version and self.path and self.line) and not self.is_generated()
 
     def render(self) -> str:
         """One line, human-readable, round-trips through `parse`."""
@@ -161,6 +174,23 @@ class Declaration:
         if self.kind:
             out += f" ({self.kind})"
         return out
+
+    @classmethod
+    def from_site(cls, site: str, kind: str = "", version: str = "",
+                  raw_pin: str = "") -> "Declaration":
+        """Build one from a `declared_in` string.
+
+        That string comes in three shapes — `path:line`, `path (table)` and a
+        bare `path` — because the formats record positions to different
+        precision.
+        """
+        text = (site or "").strip()
+        head = text.split(" (")[0].strip()
+        path, _, lpart = head.rpartition(":")
+        if not (path and lpart.isdigit()):
+            path, lpart = head, "0"
+        return cls(path=path, line=int(lpart), kind=kind, version=version,
+                   raw_pin=raw_pin)
 
     @classmethod
     def parse(cls, item: str) -> "Declaration | None":
@@ -245,31 +275,101 @@ class Dep:
     def source_files(self) -> list[str]:
         return sorted({s.path for s in self.sites})
 
-    def pin_variants(self) -> dict[str, list[str]]:
+    def ensure_declaration(self) -> None:
+        """Guarantee the invariant everything downstream relies on: a
+        dependency has at least one declaration.
+
+        A dependency declared in exactly one place is not written to
+        `CLAUDE_DEPS.md` as a list — the `pinned:` line already says it — so a
+        record read back from the file would otherwise arrive with none. The
+        list is what carries the fact that a site is *generated* and must not
+        be edited, so without this a reload silently makes a lockfile pin
+        editable again.
+        """
+        if not self.declarations and self.declared_in:
+            self.declarations = [Declaration.from_site(
+                self.declared_in, kind=self.kind, version=self.version,
+                raw_pin=self.raw_pin,
+            )]
+
+    def pin_variants(self, generated: bool | None = None) -> dict[str, list[str]]:
         """version -> the sites asserting it, for declarations carrying one.
 
         A declaration with no version (`find_package(CURL)`) is not evidence of
-        disagreement, so it does not appear here.
+        disagreement, so it does not appear here. `generated` restricts the
+        answer to lockfile-style declarations (True) or hand-written ones
+        (False); by default every declaration counts.
         """
         out: dict[str, list[str]] = {}
         for d in self.declarations:
-            if d.version:
+            if d.version and (generated is None or d.is_generated() is generated):
                 out.setdefault(d.version, []).append(d.where())
         return {v: sorted(set(w)) for v, w in sorted(out.items())}
 
     def diverges(self) -> bool:
-        """True when two declarations of this dependency pin different versions."""
-        return len(self.pin_variants()) > 1
+        """True when two *hand-written* declarations pin different versions.
+
+        Deliberately blind to lockfiles. This is the predicate `apply` refuses
+        on, and the two disagreements need different treatment: manifests
+        contradicting each other means a bump cannot know what it is bumping
+        from, whereas a lockfile contradicting the manifests is a fact about
+        the past — the edit is still well defined, and the lock is regenerated
+        rather than edited. See `lock_drift`.
+        """
+        return len(self.pin_variants(generated=False)) > 1
+
+    def lock_drift(self) -> dict[str, list[str]]:
+        """Versions a lockfile resolved that no manifest asks for.
+
+        Either the lock was never regenerated after the manifests moved, or the
+        build is not using it. Both are findings, and neither is visible from an
+        upstream lookup: this is a disagreement between two files we already
+        have. Restricted to versions absent from the hand-written declarations,
+        so a lock that merely agrees with one platform's manifest is silent.
+
+        A dependency the lockfile is the *only* record of is transitive, not
+        drifted — there is nothing for it to disagree with — so it says nothing
+        here and is reported as transitive instead.
+        """
+        asked = set(self.pin_variants(generated=False))
+        if not asked:
+            return {}
+        return {
+            v: w for v, w in self.pin_variants(generated=True).items() if v not in asked
+        }
 
     def divergence_note(self) -> str:
-        """The finding, phrased for a human. Empty when there is nothing to say."""
-        if not self.diverges():
-            return ""
-        parts = [f"{v} in {', '.join(w)}" for v, w in self.pin_variants().items()]
-        return (
-            "declarations disagree on the version — " + "; ".join(parts)
-            + " — so what ships depends on which manifest the build used"
-        )
+        """The finding(s), phrased for a human. Empty when there is nothing to say."""
+        parts = []
+        if self.diverges():
+            detail = "; ".join(
+                f"{v} in {', '.join(w)}" for v, w in self.pin_variants(generated=False).items()
+            )
+            parts.append(
+                f"declarations disagree on the version — {detail} — so what ships "
+                "depends on which manifest the build used"
+            )
+        locked = self.pin_variants(generated=True)
+        drift = self.lock_drift()
+        if len(locked) > 1:
+            # Legitimate in Conan — two profiles can resolve one build
+            # requirement differently — and still worth saying out loud, because
+            # "which version ships" then has no single answer and an advisory
+            # match against one of them is only half the story.
+            detail = "; ".join(f"{v} in {', '.join(w)}" for v, w in locked.items())
+            parts.append(
+                f"the lockfile resolves this to more than one version at once — "
+                f"{detail} — so which one is built depends on the profile that "
+                "resolved it"
+            )
+        elif drift:
+            detail = "; ".join(f"{v} in {', '.join(w)}" for v, w in drift.items())
+            asked = ", ".join(self.pin_variants(generated=False))
+            parts.append(
+                f"the lockfile resolved {detail}, which is not what is asked for "
+                f"({asked}) — either the lock is stale or the build is not using it"
+            )
+        return ". ".join(parts)
 
     def fingerprint(self, root: str) -> dict[str, str]:
         """Hashes that let /deps:sync detect drift without any LLM call."""
@@ -305,7 +405,9 @@ class Dep:
                 pins.append(pin)
         d["companion_pins"] = pins
         known = {f.name for f in dataclasses.fields(cls)}
-        return cls(**{k: v for k, v in d.items() if k in known})
+        dep = cls(**{k: v for k, v in d.items() if k in known})
+        dep.ensure_declaration()
+        return dep
 
 
 _VERSION_RE = re.compile(

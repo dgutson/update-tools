@@ -146,8 +146,26 @@ Deliberately a short list:
    problem.
 
 That Dependabot and Renovate have excellent parsers is an argument for consuming
-them, not for competing with them. See [ROADMAP item 7](ROADMAP.md) for the
-ingest plan.
+them, not for competing with them.
+
+**This is now acted on.** If [Trivy](https://github.com/aquasecurity/trivy) is
+installed, `deps` ingests it as an extra discovery source — one static binary,
+no runtime to depend on. It is entirely optional: nothing here requires it, and
+`--no-ingest` turns it off. Two rules keep the merge honest.
+
+- **Additive, never preferring.** An ingested package and a natively parsed one
+  reconcile into a single dependency carrying both declaration sites; identical
+  sites collapse. The native parsers keep the file and line that make a pin
+  *editable*, which is the whole reason they still exist.
+- **No line number means report-only.** Such a dependency is profiled, judged
+  and reported like any other, and `apply` refuses to edit it rather than
+  guessing at a position.
+
+On the C++ project this was measured against, the ingest found 15 NuGet packages
+across five manifests that no parser here can read — while adding nothing at all
+to the Conan set, where the native parser is strictly better (Trivy reads
+`conan.lock` but not `conanfile.txt`, and only its `requires` section). That
+split is the argument for the whole arrangement.
 
 ## Install
 
@@ -255,6 +273,32 @@ version-less CMake declaration wins and the tool ends up comparing *your machine
 system library against what distros ship — recommending a CI-image change for a
 library the project statically links from its own manifest. The two declarations
 are now folded into one dependency, with both names and both sites kept.
+
+### And the lockfile beside them
+
+`conan.lock` is read as a declaration site too, which answers a different
+question: not what you ask for, but what resolution actually picked. Three
+findings come out of that, none of them needing a network call.
+
+```
+!= libarchive       the lockfile resolved 3.7.1 in conan.lock:11, which is not
+   what is asked for (3.8.1) — either the lock is stale or the build is not
+   using it
+```
+
+- **The lock disagreeing with the manifest.** Above — and unlike two manifests
+  disagreeing, it does *not* block a bump: the edit is well defined, so `apply`
+  edits the manifest and tells you which generated file still records the old
+  version and needs regenerating.
+- **The transitive set.** Libraries that ship but that no manifest names. They
+  are marked as such, because a transitive dependency has no call sites of yours
+  by definition — an empty usage profile there means "we do not call it
+  directly", not "it is unused".
+- **Build-only requirements**, kept out of the runtime risk list.
+
+A lockfile pin is never edited. It has a version and a line, but it sits beside
+the recipe revision it was resolved with, so hand-editing one desynchronises the
+pair — regenerating it is the package manager's job, not this tool's.
 
 ## Coupled pins
 
@@ -484,13 +528,17 @@ python3 -m deptool --root ~/src/zeta-daw revert --dep hegel
 `--json` on `profile`, `status`, `check` and `apidiff` gives machine-readable
 output. `check` runs the header diff automatically for C/C++ dependencies with a
 readable GitHub upstream; `--no-api-diff` skips it and `--max-headers N` widens
-the budget.
+the budget. `--no-ingest` restricts discovery to the native parsers, ignoring an
+installed Trivy.
 
 ### What touches your files, and when
 
 Everything except `apply` is read-only. `profile` writes `CLAUDE_DEPS.md` and
 nothing else; `check`, `status`, `apidiff` and `plan` write nothing at all —
-`plan` exists precisely so you can see the edit before agreeing to it.
+`plan` exists precisely so you can see the edit before agreeing to it. That
+holds for the ingest as well: an installed scanner is run read-only over your
+tree, and `apply` refuses anything it reported without a line number rather
+than editing at a guessed position.
 
 `apply` edits your manifest, and only when you run it. Two things keep that
 contained:
