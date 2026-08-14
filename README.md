@@ -223,11 +223,14 @@ Test-only; never linked into the shipped binary, so the blast radius of a
 bump is confined to CI. …
 ```
 
-Five things make this more than a copy of the manifest:
+Six things make this more than a copy of the manifest:
 
 - **`consumed` / `sites`** — the API surface, which is what turns a changelog
   into a decision.
 - **`scope-evidence`** — *why* it concluded test-only, so you can disagree.
+- **`patched`** — evidence that what ships is **not** upstream's release, so
+  every upstream-derived claim about it is about a nearby artifact (see
+  [What actually ships](#what-actually-ships)).
 - **`companion-pins`** — coupled versions that must move together (see below).
 - **`declarations`** — every place the dependency is pinned, when there is more
   than one (see [Manifests that disagree](#manifests-that-disagree)).
@@ -299,6 +302,48 @@ findings come out of that, none of them needing a network call.
 A lockfile pin is never edited. It has a version and a line, but it sits beside
 the recipe revision it was resolved with, so hand-editing one desynchronises the
 pair — regenerating it is the package manager's job, not this tool's.
+
+## What actually ships
+
+Everything the tool learns from upstream — the header diff, the release notes, an
+advisory match — is a claim about the library *as published*. That is frequently
+not the library that gets built, and the difference is declared in three places
+the tool now reads:
+
+```
+/= openssl    ci/build_openssl.sh:4 declares a patch against recipes/openssl/ —
+   the build uses a modified recipe, not the published one
+/= libarchive Conan Center applies 3 patch(es) to libarchive 3.8.7 before
+   building — all declared `patch_type: conan`, i.e. build-system plumbing
+   rather than behaviour — so what ships is not upstream's release
+```
+
+- **A `PATCH_COMMAND`** on a `FetchContent_Declare`.
+- **A tracked diff against a package recipe**, typically applied by a CI script.
+  Tracked-only on purpose: a patch a fresh checkout does not get is not what the
+  build applies.
+- **The Conan Center recipe's own patches**, which apply even when nobody on your
+  side has touched anything.
+
+This never changes a recommendation's priority — only its confidence, and the
+report says so rather than discounting quietly. Where Conan declares
+`patch_type`, the weighting reads it: three patches that are all build-system
+plumbing are much weaker evidence of a moved API than one untyped patch. And when
+the pinned version has been pruned from the recipe, the patch set that built it is
+unrecoverable — reported as **cannot be established**, which is not the same
+answer as *none*.
+
+The caveat also rides on the header diff itself, because that is the output that
+reads as factual:
+
+```
+== nothing we consume was removed or re-signatured (0 removal(s) upstream, none ours)
+ ! this diff is against libarchive/libarchive as published, which is not what ships: …
+```
+
+A locally patched dependency is worth knowing about even with no upgrade pending:
+the patch has to be re-applied on every bump, and the reason for it is usually
+undocumented.
 
 ## Coupled pins
 
@@ -429,7 +474,7 @@ Consumed-symbol extraction is pluggable and auto-detected:
 |---|---|---|
 | `builtin` | always available | includes/imports → symbols → `file:line` sites |
 | [`graphify`](https://github.com/Graphify-Labs/graphify) | `graphify-out/graph.json` | blast radius: direct and transitive callers |
-| [`codebase-memory`](https://github.com/DeusData/codebase-memory-mcp) | binary on `PATH` | caller counts via `trace_path` — **untested, see [roadmap 10](ROADMAP.md)** |
+| [`codebase-memory`](https://github.com/DeusData/codebase-memory-mcp) | binary on `PATH` | caller counts via `trace_path` — **untested, see [verification debt](ROADMAP.md#7-verification-debt)** |
 
 `builtin` always runs — it produces the auditable `file:line` sites. A graph
 backend enriches rather than replaces. Nothing breaks if you have neither.
@@ -569,9 +614,10 @@ The test suite runs under `uv run`; the tool itself is exercised with a bare
 ## Status
 
 v0.1.0. Developed and verified against [zeta-daw](https://github.com/dgutson/zeta-daw)
-(C++20/CMake). See [ROADMAP.md](ROADMAP.md) — including
-[item 10](ROADMAP.md), an explicit list of code paths not yet run against
-reality.
+(C++20/CMake). [ROADMAP.md](ROADMAP.md) is the open work, including
+[verification debt](ROADMAP.md#7-verification-debt) — an explicit list of code
+paths not yet run against reality. [HISTORY.md](HISTORY.md) is the closed record:
+what shipped, what was measured, and what was decided against.
 
 ## Licence
 

@@ -255,6 +255,13 @@ def _parse_fetchcontent(cmd: Command) -> Dep | None:
     git_tag = _kv(cmd.args, "GIT_TAG")
     url_hash = _kv(cmd.args, "URL_HASH") or _kv(cmd.args, "URL_MD5")
     where = f"{cmd.file}:{cmd.line}"
+    # A declared modification of the sources, so every claim derived from
+    # upstream is about a different artifact than the one that gets built.
+    # `FetchContent_Declare` forwards both of these to `ExternalProject_Add`.
+    patch_cmd = _kv(cmd.args, "PATCH_COMMAND") or _kv(cmd.args, "UPDATE_COMMAND")
+    patched = (
+        [f"declared PATCH_COMMAND at {where}: {patch_cmd}"] if patch_cmd else []
+    )
 
     if url:
         up = Upstream()
@@ -279,6 +286,7 @@ def _parse_fetchcontent(cmd: Command) -> Dep | None:
             if cmd.scope != "runtime"
             else [],
             upstream=up,
+            patched=patched,
         )
 
     if git_repo:
@@ -296,6 +304,7 @@ def _parse_fetchcontent(cmd: Command) -> Dep | None:
             declared_in=where,
             scope=cmd.scope,
             upstream=up,
+            patched=patched,
             notes=[
                 "GIT_TAG is a commit SHA, not a tag — frozen at a point in "
                 "time with no version to compare against; check what has "

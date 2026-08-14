@@ -2324,6 +2324,470 @@ def test_a_missing_recipe_resolves_to_nothing_rather_than_raising(monkeypatch):
     assert upstream._conan_versions("no-such-package") == []
 
 
+# Every shape below was read from the live conan-center-index in 2026-08; the
+# comment on each names the recipe it came from, because a fixture nobody can
+# trace back to a real recipe is a guess about the format.
+_CONANDATA_SCALAR = """\
+sources:
+  "3.11.3":
+    url: "https://github.com/nlohmann/json/archive/v3.11.3.tar.gz"
+    sha256: "0d8ef5af7f9794e3263480193c491549b2ba6cc74bb018906202ada498a79406"
+  "3.11.2":
+    url: "https://github.com/nlohmann/json/archive/v3.11.2.tar.gz"
+    sha256: "d69f9deb6a75e2580465c6c4c5111b89c4dc2fa94e3a85fcd2ffcd9a143d9273"
+"""
+
+# zlib and libcurl both list a project mirror *ahead* of the repository.
+_CONANDATA_MIRROR_FIRST = """\
+sources:
+  "1.3.2":
+    url:
+      - "https://zlib.net/fossils/zlib-1.3.2.tar.gz"
+      - "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz"
+    sha256: "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16"
+patches:
+  "1.3.2":
+    - patch_file: "patches/01-keep-previous-filenames.patch"
+"""
+
+# pkgconf builds from distfiles.ariadne.space; xz_utils and libiconv are the
+# same story with tukaani.org and a GNU mirror.
+_CONANDATA_NO_GITHUB = """\
+sources:
+  "2.1.0":
+    url: "https://distfiles.ariadne.space/pkgconf/pkgconf-2.1.0.tar.xz"
+    sha256: "3fbe5b4e1cbc0c92b1cf0ea18b0efb7bd651c1e3e4e0e9c0b7a4b8c4f8e1a2b3"
+"""
+
+# cmake/binary ships prebuilt archives keyed by OS and architecture.
+_CONANDATA_PER_PLATFORM = """\
+sources:
+  "1.14.0":
+    Linux:
+      armv8:
+        url: "https://github.com/google/googletest/archive/v1.14.0-arm.tar.gz"
+        sha256: "aaa"
+      x86_64:
+        url: "https://github.com/google/googletest/archive/v1.14.0.tar.gz"
+        sha256: "bbb"
+    Windows:
+      x86_64:
+        url: "https://github.com/google/googletest/archive/v1.14.0-win.zip"
+        sha256: "ccc"
+"""
+
+
+def _index(config, conandata):
+    """Stand in for the two files a recipe lookup reads."""
+    def fetch(repo, path, ref):
+        if path.endswith("config.yml"):
+            return config
+        if path.endswith("conandata.yml"):
+            return conandata
+        return ""
+    return fetch
+
+
+def test_a_conan_recipe_resolves_to_the_repository_its_sources_come_from(monkeypatch):
+    """The recipe name is not a repository, and this is what makes the header
+    diff — the tool's central mechanism — reach Conan-pinned C/C++ at all."""
+    from deptool import upstream
+
+    config = 'versions:\n  "3.11.3":\n    folder: all\n'
+    monkeypatch.setattr(upstream, "fetch_file", _index(config, _CONANDATA_SCALAR))
+    repo, why = upstream.conan_source_repo("nlohmann_json", "3.11.3")
+    assert repo == "nlohmann/json"
+    assert "for 3.11.3" in why and "recipes/nlohmann_json/all/conandata.yml" in why
+
+
+def test_a_mirror_listed_ahead_of_the_repository_does_not_win(monkeypatch):
+    """zlib leads with zlib.net and libcurl with curl.se, so the rule is the
+    first URL that is a GitHub repository — not the first URL."""
+    from deptool import upstream
+
+    config = 'versions:\n  "1.3.2":\n    folder: all\n'
+    monkeypatch.setattr(upstream, "fetch_file", _index(config, _CONANDATA_MIRROR_FIRST))
+    assert upstream.conan_source_repo("zlib", "1.3.2")[0] == "madler/zlib"
+
+
+def test_a_patch_url_is_not_mistaken_for_the_source_repository(monkeypatch):
+    """`patches:` also carries URLs, and a patch is not where the code lives."""
+    from deptool import upstream
+
+    conandata = _CONANDATA_NO_GITHUB + (
+        'patches:\n  "2.1.0":\n'
+        '    - patch_file: "patches/fix.patch"\n'
+        '      url: "https://github.com/conan-io/conan-center-index/raw/master/x.patch"\n'
+    )
+    config = 'versions:\n  "2.1.0":\n    folder: all\n'
+    monkeypatch.setattr(upstream, "fetch_file", _index(config, conandata))
+    repo, why = upstream.conan_source_repo("pkgconf", "2.1.0")
+    assert repo == ""
+    assert "no GitHub source URL" in why
+
+
+def test_per_platform_source_urls_are_searched(monkeypatch):
+    """Nested OS/architecture keys need no special case: everything indented
+    under the version key belongs to the version."""
+    from deptool import upstream
+
+    config = 'versions:\n  "1.14.0":\n    folder: all\n'
+    monkeypatch.setattr(upstream, "fetch_file", _index(config, _CONANDATA_PER_PLATFORM))
+    assert upstream.conan_source_repo("gtest", "1.14.0")[0] == "google/googletest"
+
+
+def test_the_recipe_folder_is_read_not_assumed_to_be_all(monkeypatch):
+    """openssl splits `3.x.x` from `4.x.x`, so `all` is not a safe guess."""
+    from deptool import upstream
+
+    seen = []
+
+    def fetch(repo, path, ref):
+        seen.append(path)
+        if path.endswith("config.yml"):
+            return _CONAN_CONFIG
+        return 'sources:\n  3.6.3:\n    url: "https://github.com/openssl/openssl/x.tar.gz"\n'
+
+    monkeypatch.setattr(upstream, "fetch_file", fetch)
+    assert upstream.conan_source_repo("openssl", "3.6.3")[0] == "openssl/openssl"
+    assert "recipes/openssl/3.x.x/conandata.yml" in seen
+    # The version key is unquoted in this recipe, which must parse the same way.
+    assert "for 3.6.3" in upstream.conan_source_repo("openssl", "3.6.3")[1]
+
+
+def test_a_pruned_pin_still_resolves_to_the_repository(monkeypatch):
+    """The catalogue is pruned, not historical, so the pinned version is often
+    already gone — but the repository is a property of the recipe, not of the
+    version, so the question is still answerable. Says which it used."""
+    from deptool import upstream
+
+    config = 'versions:\n  "3.11.3":\n    folder: all\n'
+    monkeypatch.setattr(upstream, "fetch_file", _index(config, _CONANDATA_SCALAR))
+    repo, why = upstream.conan_source_repo("nlohmann_json", "3.9.1")
+    assert repo == "nlohmann/json"
+    assert "another version" in why and "3.9.1 is not in it" in why
+
+
+def test_an_unreadable_recipe_resolves_to_nothing_rather_than_raising(monkeypatch):
+    from deptool import upstream
+
+    monkeypatch.setattr(upstream, "fetch_file", lambda *a, **k: "")
+    repo, why = upstream.conan_source_repo("no-such-package", "1.0")
+    assert repo == ""
+    assert "no sources" in why
+
+
+def test_the_header_diff_runs_once_a_conan_recipe_has_a_repository():
+    """The gate used to be `upstream.kind == "github"`, which refused every
+    Conan dependency — the entire dependency set of a Conan project."""
+    from deptool import apidiff
+
+    dep = _fs_dep()
+    dep.kind = "conan"
+    dep.upstream = Upstream(kind="conan", ref="fluidsynth")
+    assert dep.diff_repo() == ""
+    refused = apidiff.surface_change(dep, "2.3.4", "2.5.7")
+    assert refused["resolved"] is False
+    assert "conan:fluidsynth" in refused["reason"]
+
+    dep.upstream.source_repo = "FluidSynth/fluidsynth"
+    assert dep.diff_repo() == "FluidSynth/fluidsynth"
+    files = {
+        ("v2.3.4", "include/fs/synth.h"):
+            "int fluid_synth_noteon(int a);\nvoid fluid_synth_gone(int a);\n",
+        ("v2.5.7", "include/fs/synth.h"): "int fluid_synth_noteon(int a);\n",
+    }
+    fetch, tree = _fake_headers(files, ["include/fs/synth.h"])
+    got = apidiff.surface_change(dep, "2.3.4", "2.5.7", fetch=fetch, tree=tree)
+    assert got["resolved"] is True
+    assert got["repo"] == "FluidSynth/fluidsynth"
+    assert [h["symbol"] for h in got["affects_us"]] == ["fluid_synth_gone"]
+
+
+def test_the_recipe_stays_the_version_source():
+    """Resolving the repository must not repoint the version lookup: Conan
+    Center is what says whether a pin is still installable."""
+    dep = Dep(name="zlib", kind="conan", version="1.3.1",
+              upstream=Upstream(kind="conan", ref="zlib", source_repo="madler/zlib"))
+    assert dep.upstream.kind == "conan"
+    assert dep.upstream.ref == "zlib"
+    assert dep.diff_repo() == "madler/zlib"
+
+
+def test_the_published_tag_is_read_from_the_recipe_not_guessed(monkeypatch):
+    """`v<version>` and `<version>` are wrong for any project that prefixes its
+    tags, and a wrong guess removes the diff rather than degrading it."""
+    from deptool import upstream
+
+    config = 'versions:\n  "3.6.3":\n    folder: "3.x.x"\n'
+    conandata = (
+        'sources:\n  3.6.3:\n'
+        '    url: "https://github.com/openssl/openssl/releases/download/'
+        'openssl-3.6.3/openssl-3.6.3.tar.gz"\n'
+    )
+    monkeypatch.setattr(upstream, "fetch_file", _index(config, conandata))
+    got = upstream._conan_versions("openssl")
+    assert [(v["version"], v["tag"]) for v in got] == [("3.6.3", "openssl-3.6.3")]
+    # And it is offered ahead of the guesses.
+    assert upstream.tag_forms("3.6.3", got)[0] == "openssl-3.6.3"
+
+
+def test_an_archive_url_carries_the_tag_too(monkeypatch):
+    """Two URL shapes appear across the index: a release asset sits under its
+    tag, and an archive is named after it."""
+    from deptool import upstream
+
+    assert upstream._tag_from_url(
+        "https://github.com/nlohmann/json/archive/v3.11.3.tar.gz") == "v3.11.3"
+    assert upstream._tag_from_url(
+        "https://github.com/a/b/archive/refs/tags/rel-1.2.tar.xz") == "rel-1.2"
+    assert upstream._tag_from_url(
+        "https://github.com/curl/curl/releases/download/curl-8_21_0/curl-8.21.0.tar.xz"
+    ) == "curl-8_21_0"
+    # Nothing to read is not a wrong answer.
+    assert upstream._tag_from_url("https://zlib.net/fossils/zlib-1.3.2.tar.gz") == ""
+
+
+def test_a_pruned_pin_gets_the_convention_upstream_demonstrably_follows():
+    """The pinned version is usually gone from the pruned catalogue, and it is
+    one end of every diff — so its tag has to come from somewhere. A pattern
+    derived from upstream's own (version, tag) pairs is a reading of a declared
+    convention, not a guess."""
+    from deptool import upstream
+
+    openssl = [{"version": "3.6.3", "tag": "openssl-3.6.3"}]
+    assert upstream.tag_forms("3.2.1", openssl)[0] == "openssl-3.2.1"
+
+    # curl rewrites the dots, so the separator has to be derived as well.
+    curl = [{"version": "8.21.0", "tag": "curl-8_21_0"}]
+    assert upstream.tag_forms("8.4.0", curl)[0] == "curl-8_4_0"
+
+    # A project whose tags are already the bare version contributes no template,
+    # and the existing guesses still cover it.
+    plain = [{"version": "1.5.7", "tag": "1.5.7"}]
+    assert upstream.tag_templates(plain) == []
+    assert upstream.tag_forms("1.5.5", plain) == ["v1.5.5", "1.5.5"]
+
+
+def test_an_inline_comment_does_not_hide_a_version(monkeypatch):
+    """openssl annotates its LTS and FIPS entries (`3.5.7: # LTS: …`). Requiring
+    end-of-line after the colon skipped exactly those versions, which then read
+    as absent from the recipe — a wrong answer, not a missing one."""
+    from deptool import upstream
+
+    config = (
+        'versions:\n'
+        '  "3.6.3":\n    folder: "3.x.x"\n'
+        '  3.5.7: # LTS: keep until the next LTS is designated\n    folder: "3.x.x"\n'
+    )
+    conandata = (
+        'sources:\n'
+        '  3.6.3:\n    url: "https://github.com/openssl/openssl/releases/download/'
+        'openssl-3.6.3/openssl-3.6.3.tar.gz"\n'
+        '  3.5.7: # LTS: keep until the next LTS is designated\n'
+        '    url: "https://github.com/openssl/openssl/releases/download/'
+        'openssl-3.5.7/openssl-3.5.7.tar.gz"\n'
+    )
+    monkeypatch.setattr(upstream, "fetch_file", _index(config, conandata))
+    assert upstream._conan_folders("openssl") == {"3.6.3": "3.x.x", "3.5.7": "3.x.x"}
+    got = {v["version"]: v["tag"] for v in upstream._conan_versions("openssl")}
+    assert got == {"3.6.3": "openssl-3.6.3", "3.5.7": "openssl-3.5.7"}
+    # And the commented version is genuinely present, so its patch set is knowable.
+    assert upstream.conan_recipe_patches("openssl", "3.5.7") == ([], True)
+
+
+# libarchive 3.8.7 as the live index carries it: several patches, every one
+# declared as build-system plumbing.
+_CONANDATA_PATCHED_PLUMBING = """\
+sources:
+  "3.8.7":
+    url: "https://github.com/libarchive/libarchive/releases/download/v3.8.7/x.tar.xz"
+    sha256: "d3a8"
+patches:
+  "3.8.7":
+    - patch_file: "patches/0003-3.8.7-cmake.patch"
+      patch_description: "Make CMake build-system compatible with Conan"
+      patch_type: "conan"
+    - patch_file: "patches/0005-3.8.7-try-compile-cmakedeps.patch"
+      patch_description: "Patch try_compile check to work with imported targets"
+      patch_type: "conan"
+"""
+
+# zlib 1.3.2 as the live index carries it: one patch, no declared type.
+_CONANDATA_PATCHED_UNTYPED = """\
+sources:
+  "1.3.2":
+    url:
+      - "https://zlib.net/fossils/zlib-1.3.2.tar.gz"
+      - "https://github.com/madler/zlib/releases/download/v1.3.2/zlib-1.3.2.tar.gz"
+    sha256: "bb32"
+patches:
+  "1.3.2":
+    - patch_file: "patches/01-keep-previous-filenames.patch"
+"""
+
+
+def test_build_system_plumbing_patches_are_weighted_lower(monkeypatch):
+    """`patch_type` is declared, so the weighting reads it instead of guessing."""
+    from deptool import upstream
+
+    config = 'versions:\n  "3.8.7":\n    folder: all\n'
+    monkeypatch.setattr(
+        upstream, "fetch_file", _index(config, _CONANDATA_PATCHED_PLUMBING))
+    patches, known = upstream.conan_recipe_patches("libarchive", "3.8.7")
+    assert known is True
+    assert [p["type"] for p in patches] == ["conan", "conan"]
+    why = upstream.patch_evidence("libarchive", "3.8.7", patches, known)
+    assert "2 patch(es)" in why
+    assert "build-system plumbing" in why
+    assert "may change behaviour" not in why
+
+
+def test_an_untyped_patch_is_not_assumed_harmless(monkeypatch):
+    from deptool import upstream
+
+    config = 'versions:\n  "1.3.2":\n    folder: all\n'
+    monkeypatch.setattr(
+        upstream, "fetch_file", _index(config, _CONANDATA_PATCHED_UNTYPED))
+    patches, known = upstream.conan_recipe_patches("zlib", "1.3.2")
+    assert [p["file"] for p in patches] == ["patches/01-keep-previous-filenames.patch"]
+    why = upstream.patch_evidence("zlib", "1.3.2", patches, known)
+    assert "may change behaviour" in why
+
+
+def test_an_unpatched_recipe_says_nothing(monkeypatch):
+    """Silence is the right output here — a caveat on every dependency is noise."""
+    from deptool import upstream
+
+    config = 'versions:\n  "3.11.3":\n    folder: all\n'
+    monkeypatch.setattr(upstream, "fetch_file", _index(config, _CONANDATA_SCALAR))
+    patches, known = upstream.conan_recipe_patches("nlohmann_json", "3.11.3")
+    assert patches == [] and known is True
+    assert upstream.patch_evidence("nlohmann_json", "3.11.3", patches, known) == ""
+
+
+def test_a_pruned_version_cannot_establish_its_patches(monkeypatch):
+    """"No patches declared" and "cannot tell" are different answers, and the
+    pruned catalogue makes the second one common."""
+    from deptool import upstream
+
+    config = 'versions:\n  "1.3.2":\n    folder: all\n'
+    monkeypatch.setattr(
+        upstream, "fetch_file", _index(config, _CONANDATA_PATCHED_UNTYPED))
+    patches, known = upstream.conan_recipe_patches("zlib", "1.2.11")
+    assert patches == [] and known is False
+    why = upstream.patch_evidence("zlib", "1.2.11", patches, known)
+    assert "cannot be established" in why
+    assert "no longer in the recipe" in why
+
+
+def test_a_patch_command_in_the_build_files_is_a_declared_modification(tmp_path):
+    """Rule B: `FetchContent_Declare` forwards PATCH_COMMAND to ExternalProject,
+    so this is upstream's source being changed before it is built."""
+    from deptool import discover
+
+    (tmp_path / "CMakeLists.txt").write_text(
+        'cmake_minimum_required(VERSION 3.20)\n'
+        'project(p CXX)\n'
+        'include(FetchContent)\n'
+        'FetchContent_Declare(zoo\n'
+        '  URL https://github.com/acme/zoo/archive/refs/tags/v1.2.0.tar.gz\n'
+        '  PATCH_COMMAND patch -p1 < ${CMAKE_SOURCE_DIR}/zoo.diff\n'
+        ')\n'
+    )
+    deps, _ = discover.discover(str(tmp_path), ingest=False)
+    zoo = next(d for d in deps if d.name == "zoo")
+    assert len(zoo.patched) == 1
+    assert "PATCH_COMMAND" in zoo.patched[0]
+    assert "CMakeLists.txt:4" in zoo.patched[0]
+
+
+def test_a_tracked_diff_against_a_recipe_is_a_declared_modification(tmp_path):
+    """Rule C: the observed case is a CI script applying a `patch` heredoc, so
+    there is no local `recipes/` directory — the diff header is the fact."""
+    import subprocess
+
+    from deptool import discover
+
+    root = str(tmp_path)
+    subprocess.run(["git", "init", "-q", root], check=True)
+    (tmp_path / "conanfile.txt").write_text("[requires]\nopenssl/3.2.1\nzlib/1.3\n")
+    (tmp_path / "build.sh").write_text(
+        "#!/bin/sh\n"
+        "patch <<EOF\n"
+        "diff --git a/recipes/openssl/3.x.x/conanfile.py b/recipes/openssl/3.x.x/conanfile.py\n"
+        "--- a/recipes/openssl/3.x.x/conanfile.py\n"
+        "+++ b/recipes/openssl/3.x.x/conanfile.py\n"
+        '+        "rand_seed": [None, "ANY"],\n'
+        "EOF\n"
+    )
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+
+    sites = discover.recipe_patch_sites(root)
+    assert set(sites) == {"openssl"}
+    # Both halves of the header match; one patch is one fact.
+    assert len(sites["openssl"]) == 1
+    assert "build.sh:4" in sites["openssl"][0]
+
+    deps, _ = discover.discover(root, ingest=False)
+    assert next(d for d in deps if d.name == "openssl").patched
+    # And only that one: zlib is pinned in the same manifest and is untouched.
+    assert not next(d for d in deps if d.name == "zlib").patched
+
+
+def test_an_untracked_patch_is_not_evidence(tmp_path):
+    """`git grep` scopes this to tracked files on purpose: a patch a fresh
+    checkout does not get is not what the build applies."""
+    import subprocess
+
+    from deptool import discover
+
+    root = str(tmp_path)
+    subprocess.run(["git", "init", "-q", root], check=True)
+    (tmp_path / "stray.sh").write_text(
+        "--- a/recipes/openssl/3.x.x/conanfile.py\n"
+        "+++ b/recipes/openssl/3.x.x/conanfile.py\n"
+    )
+    assert discover.recipe_patch_sites(root) == {}
+
+
+def test_a_patched_dependency_carries_the_caveat_into_the_diff():
+    """The diff is the output that reads as factual, so that is where it has to
+    say it read a repository that is not what ships."""
+    from deptool import apidiff
+
+    dep = _fs_dep()
+    dep.patched = ["ci/build.sh:4 declares a patch against recipes/fluidsynth/"]
+    files = {
+        ("v2.3.4", "include/fs/synth.h"):
+            "int fluid_synth_noteon(int a);\nvoid fluid_synth_gone(int a);\n",
+        ("v2.5.7", "include/fs/synth.h"): "int fluid_synth_noteon(int a);\n",
+    }
+    fetch, tree = _fake_headers(files, ["include/fs/synth.h"])
+    got = apidiff.surface_change(dep, "2.3.4", "2.5.7", fetch=fetch, tree=tree)
+
+    assert got["resolved"] is True
+    caveat = [n for n in got["notes"] if "not what ships" in n]
+    assert len(caveat) == 1
+    assert "ci/build.sh:4" in caveat[0]
+    # The finding itself still stands; this lowers confidence, not priority.
+    assert [h["symbol"] for h in got["affects_us"]] == ["fluid_synth_gone"]
+
+
+def test_patched_evidence_survives_the_profile_file(tmp_path):
+    """It is a repo-declared fact, so it belongs in CLAUDE_DEPS.md and has to
+    come back when the file is read."""
+    from deptool import profile
+
+    dep = Dep(name="openssl", kind="conan", version="3.2.1",
+              declared_in="conanfile.txt:2",
+              patched=["ci/build.sh:4 declares a patch against recipes/openssl/"])
+    text = profile.render([dep], str(tmp_path), {"repo": "r"})
+    assert "- patched:" in text
+    back, _ = profile.parse(text)
+    assert back[0].patched == dep.patched
+
+
 def test_behind_by_is_marked_a_floor_for_a_pruned_catalogue(monkeypatch):
     """Conan Center deletes old recipe versions — `zlib` lists exactly one — so
     a count of what is newer is a lower bound, not a release count."""

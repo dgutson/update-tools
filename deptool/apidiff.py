@@ -731,18 +731,18 @@ def surface_change(
         "notes": [],
     }
 
-    if dep.upstream.kind != "github" or "/" not in (dep.upstream.ref or ""):
+    repo = dep.diff_repo()
+    if not repo:
         result["reason"] = (
             f"no readable upstream repository (upstream is "
             f"{dep.upstream.kind or 'unknown'}:{dep.upstream.ref or '?'}) — the API "
             f"surface cannot be diffed, so the release notes are the only evidence"
         )
         return result
+    result["repo"] = repo
     if not (from_version and to_version):
         result["reason"] = "need both a current and a target version to diff"
         return result
-
-    repo = dep.upstream.ref
     from_ref, from_tree = _first_readable_ref(repo, from_version, versions, tree)
     to_ref, to_tree = _first_readable_ref(repo, to_version, versions, tree)
     if not (from_ref and to_ref):
@@ -878,6 +878,14 @@ def surface_change(
         "unconditionally, and constructors, out-of-line definitions and parameter "
         "lists containing parentheses are not matched"
     )
+    if dep.patched:
+        # The diff read upstream's headers, and upstream is not what gets built
+        # here. Saying so on the diff itself matters more than saying it in the
+        # finding, because this is the output that reads as factual.
+        result["notes"].append(
+            f"this diff is against {repo} as published, which is not what ships: "
+            + "; ".join(dep.patched)
+        )
     if result["truncated"]:
         result["notes"].append(
             f"read {len(selected)} of {len(ordered)} public headers (budget), chosen "

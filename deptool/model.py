@@ -232,6 +232,12 @@ class Upstream:
     kind: str = ""  # github | pypi | npm | crates | gomod | distro | unknown
     ref: str = ""  # owner/repo, package name, ...
     note: str = ""
+    # `owner/repo` the sources actually come from, when `ref` is not itself a
+    # repository — a Conan recipe name is the case this exists for. Resolved
+    # from the network on demand and deliberately never written to
+    # CLAUDE_DEPS.md: everything the profile records is read from the repository
+    # itself, and `status` must keep working offline.
+    source_repo: str = ""
 
     def is_resolvable(self) -> bool:
         return bool(self.kind and self.kind != "unknown" and self.ref)
@@ -254,6 +260,11 @@ class Dep:
     aliases: list[str] = field(default_factory=list)
     scope: str = "runtime"
     scope_evidence: list[str] = field(default_factory=list)
+    # Why the tool believes what ships is not upstream's release — a local
+    # PATCH_COMMAND, a tracked diff against the recipe, or the recipe's own
+    # patches. Evidence rather than a flag, for the same reason as
+    # `scope_evidence`: the user has to be able to disagree with it.
+    patched: list[str] = field(default_factory=list)
     upstream: Upstream = field(default_factory=Upstream)
     installed_version: str = ""  # for system deps: what is on this machine
     # Filled in by an analysis backend.
@@ -274,6 +285,18 @@ class Dep:
 
     def source_files(self) -> list[str]:
         return sorted({s.path for s in self.sites})
+
+    def diff_repo(self) -> str:
+        """The GitHub repository whose headers can be diffed; "" when there is none.
+
+        For most dependencies the upstream *is* the repository. For a Conan one
+        the upstream is a recipe name and the repository is whatever the recipe's
+        sources point at — two different facts, so both are kept: the recipe
+        remains what the version catalogue is queried by.
+        """
+        if self.upstream.kind == "github" and "/" in self.upstream.ref:
+            return self.upstream.ref
+        return self.upstream.source_repo if "/" in self.upstream.source_repo else ""
 
     def ensure_declaration(self) -> None:
         """Guarantee the invariant everything downstream relies on: a

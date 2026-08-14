@@ -76,6 +76,51 @@ def submodule_paths(root: str) -> set[str]:
     }
 
 
+# A tracked diff header naming a recipe path is a *declared* modification of
+# that recipe: the project builds a patched copy rather than the published one.
+# The observed case is a CI script applying a `patch` heredoc, so there is no
+# local `recipes/` directory to find — the diff header is the whole fact, and
+# looking for the dependency's name anywhere in the tree would not be evidence.
+_RECIPE_DIFF = re.compile(r"^(?:---|\+\+\+) [ab]/recipes/([^/\s]+)/")
+
+
+def recipe_patch_sites(root: str) -> dict[str, list[str]]:
+    """recipe name -> where the repository declares a patch against it.
+
+    Uses `git grep`, which is both fast (~30ms on a 1200-file tree) and exactly
+    the right scope: a patch that is not tracked is not what a fresh checkout
+    builds. Returns `{}` when this is not a git checkout, because a detection we
+    could not run must read as "not established", never as "not patched".
+    """
+    if not shutil.which("git"):
+        return {}
+    try:
+        proc = subprocess.run(
+            ["git", "grep", "-nIE", r"^(---|\+\+\+) [ab]/recipes/[^/]+/"],
+            cwd=root, capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+
+    # Both halves of a diff header match, and one patch is one fact, so collapse
+    # to the first line per (recipe, file).
+    first: dict[tuple[str, str], str] = {}
+    for line in proc.stdout.splitlines():
+        path, _, rest = line.partition(":")
+        lineno, _, body = rest.partition(":")
+        m = _RECIPE_DIFF.match(body.strip())
+        if m and path:
+            first.setdefault((m.group(1), path), lineno)
+
+    found: dict[str, list[str]] = {}
+    for (recipe, path), lineno in sorted(first.items()):
+        found.setdefault(recipe, []).append(
+            f"{path}:{lineno} declares a patch against recipes/{recipe}/ — the "
+            f"build uses a modified recipe, not the published one"
+        )
+    return found
+
+
 def detect_manifests(root: str) -> list[tuple[str, str]]:
     """Every manifest in the tree, as (path relative to root, ecosystem).
 
@@ -814,5 +859,16 @@ def discover(root: str, ingest: bool = True) -> tuple[list[Dep], list[str]]:
     deps = [d for d in deps if d.name not in noise]
 
     deps = reconcile(deps)
+
+    # After reconciliation, so a dependency folded together from a CMake name
+    # and a package name is matched under either.
+    patches = recipe_patch_sites(root)
+    if patches:
+        for dep in deps:
+            for name in [dep.name, *dep.aliases]:
+                for ev in patches.get(name, []):
+                    if ev not in dep.patched:
+                        dep.patched.append(ev)
+
     deps.sort(key=lambda d: (d.scope, d.name.lower()))
     return deps, sorted(set(files))

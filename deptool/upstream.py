@@ -115,12 +115,44 @@ def list_files(repo: str, ref: str) -> list[str]:
     ]
 
 
+MAX_TAG_TEMPLATES = 3
+
+
+def tag_templates(versions: list[dict] | None) -> list[tuple[str, str]]:
+    """Naming patterns upstream demonstrably uses, as (template, separator).
+
+    Derived from its own `(version, tag)` pairs rather than assumed. This is what
+    covers the pinned version being *pruned* from the catalogue — the common case,
+    and the one that matters most, because the pin is one end of every diff. If
+    openssl publishes 3.6.3 as `openssl-3.6.3`, then `openssl-3.2.1` is the
+    reading of a declared convention rather than a guess.
+    """
+    out: list[tuple[str, str]] = []
+    for v in versions or []:
+        ver, tag = v.get("version") or "", v.get("tag") or ""
+        if not ver or not tag or ver == tag:
+            continue
+        # How does the version appear inside its own tag? Verbatim, or with the
+        # dots rewritten — curl publishes 8.21.0 as `curl-8_21_0`.
+        for sep in (".", "_", "-"):
+            spelling = ver.replace(".", sep)
+            if spelling and spelling in tag:
+                entry = (tag.replace(spelling, "{v}", 1), sep)
+                if entry not in out:
+                    out.append(entry)
+                break
+        if len(out) >= MAX_TAG_TEMPLATES:
+            break
+    return out
+
+
 def tag_forms(version: str, versions: list[dict] | None = None) -> list[str]:
     """Candidate git refs for a version, best first.
 
-    Prefers the tag upstream actually published; falls back to both the `v`-
-    prefixed and bare spellings, since a resolver that guesses wrong just gets
-    an empty file back and moves on.
+    Prefers the tag upstream actually published, then the pattern it demonstrably
+    follows, then the `v`-prefixed and bare spellings. Each candidate costs one
+    tree listing when it misses, so the order is worth keeping honest: read,
+    inferred, guessed.
     """
     out: list[str] = []
     target = parse_version(version)
@@ -130,6 +162,10 @@ def tag_forms(version: str, versions: list[dict] | None = None) -> list[str]:
             continue
         if v.get("version") == version or (target and parse_version(v.get("version", "")) == target):
             out.append(tag)
+    for tmpl, sep in tag_templates(versions):
+        cand = tmpl.replace("{v}", version.replace(".", sep))
+        if cand and cand not in out:
+            out.append(cand)
     for cand in (f"v{version}", version):
         if cand and cand not in out:
             out.append(cand)
@@ -397,8 +433,11 @@ def _crates_versions(name: str) -> list[dict]:
 # no API quota when raw.githubusercontent serves it.
 CONAN_INDEX_REPO = "conan-io/conan-center-index"
 # Version keys sit at exactly one level of indentation under `versions:`, and
-# carry no inline value; `folder: all` below them does.
-_CONAN_VERSION_KEY = re.compile(r'^  "?([^"\s:#][^"\s:]*)"?\s*:\s*$', re.M)
+# carry no inline value; `folder: all` below them does. A trailing comment is
+# allowed because the index uses them — openssl annotates its LTS and FIPS
+# versions that way (`3.5.7: # LTS: keep until…`), and requiring end-of-line
+# skipped exactly those versions, which then reported as absent from the recipe.
+_CONAN_VERSION_KEY = re.compile(r'^  "?([^"\s:#][^"\s:]*)"?\s*:\s*(?:#.*)?$', re.M)
 
 
 def _conan_versions(name: str) -> list[dict]:
@@ -407,22 +446,296 @@ def _conan_versions(name: str) -> list[dict]:
     `config.yml` records no dates, so `date` is empty — `summarise` already
     tolerates that, and an unknown date is better than a guessed one.
     """
-    text = fetch_file(CONAN_INDEX_REPO, f"recipes/{name}/config.yml", "master")
-    body = text.partition("versions:")[2] if text else ""
-    if not body:
+    folders = _conan_folders(name)
+    if not folders:
         return []
+    # The tag is the one thing `config.yml` does not record, and guessing it is
+    # what made the header diff unavailable for openssl and libcurl.
+    tags = _conan_tags(name, folders)
     out = []
-    for m in _CONAN_VERSION_KEY.finditer(body):
-        ver = m.group(1)
+    for ver in folders:
         if not parse_version(ver):
             continue
         out.append({
-            "version": ver, "tag": ver, "date": "",
+            "version": ver, "tag": tags.get(ver) or ver, "date": "",
             "prerelease": bool(parse_version(ver) and parse_version(ver)[3] == 0),
             "notes": "",
             "url": f"https://conan.io/center/recipes/{name}?version={ver}",
         })
     return out
+
+
+# A recipe name is not a repository, which is why the API-surface diff — the
+# tool's central mechanism — has never been able to run on a Conan dependency.
+# The recipe itself declares where its sources come from, so read that. A
+# hand-written recipe -> repo table is what the generic-rule principle rejects,
+# and `DISTRO_GITHUB` below is already one such table too many.
+_CONAN_FOLDER = re.compile(r'^\s+folder:\s*"?([^"\s]+?)"?\s*(?:#.*)?$')
+_GITHUB_URL = re.compile(
+    r"https?://(?:www\.)?github\.com"
+    r"/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+?)(?:\.git)?(?=[/\"'\s]|$)"
+)
+
+
+def _conan_folders(name: str) -> dict[str, str]:
+    """version -> recipe folder, from `config.yml`.
+
+    A recipe is not always one folder: openssl splits `3.x.x` from `4.x.x`, so
+    the folder cannot be assumed to be `all`.
+    """
+    text = fetch_file(CONAN_INDEX_REPO, f"recipes/{name}/config.yml", "master")
+    out: dict[str, str] = {}
+    current = ""
+    for line in text.partition("versions:")[2].splitlines():
+        key = _CONAN_VERSION_KEY.match(line)
+        if key:
+            current = key.group(1)
+            continue
+        folder = _CONAN_FOLDER.match(line)
+        if folder and current:
+            out[current] = folder.group(1)
+            current = ""
+    return out
+
+
+def _mapping_block(text: str, key: str) -> str:
+    """One top-level mapping of a `conandata.yml`, and nothing else.
+
+    Stopping at the next top-level key is what keeps `sources:` and `patches:`
+    apart, and both readers need that: a patch URL is not where the library's
+    own code lives, and a source URL is not a modification of it.
+    """
+    m = re.search(rf"^{re.escape(key)}:\s*$", text, re.M)
+    if not m:
+        return ""
+    out: list[str] = []
+    for line in text[m.end():].splitlines():
+        if line.strip() and not line.startswith((" ", "\t")):
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
+def _version_blocks(block: str) -> dict[str, str]:
+    """Every version key of a mapping -> its own lines.
+
+    Everything more deeply indented belongs to the version, which is what makes
+    the per-OS/per-architecture recipes (cmake ships one URL per platform) fall
+    out without a special case.
+    """
+    out: dict[str, list[str]] = {}
+    current = ""
+    for line in block.splitlines():
+        key = _CONAN_VERSION_KEY.match(line)
+        if key:
+            current = key.group(1)
+            out.setdefault(current, [])
+            continue
+        if current:
+            out[current].append(line)
+    return {k: "\n".join(v) for k, v in out.items()}
+
+
+def _version_block(block: str, version: str) -> str:
+    return _version_blocks(block).get(version, "")
+
+
+# Where a GitHub source URL carries the tag it was cut from. Both forms appear
+# throughout the index: a release asset lives under the tag, and an archive is
+# named after it.
+_TAG_IN_RELEASE = re.compile(r"/releases/download/([^/]+)/")
+_TAG_IN_ARCHIVE = re.compile(
+    r"/archive/(?:refs/tags/)?([^/]+?)(?:\.tar\.[a-z0-9]+|\.tgz|\.zip|\.tar)$"
+)
+
+
+def _tag_from_url(url: str) -> str:
+    """The git tag a source URL points at; "" when it carries none."""
+    for pattern in (_TAG_IN_RELEASE, _TAG_IN_ARCHIVE):
+        m = pattern.search(url)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _conan_tags(name: str, folders: dict[str, str]) -> dict[str, str]:
+    """version -> the tag upstream actually published, read from the recipe.
+
+    `tag_forms` guesses `v<version>` and `<version>`. That is wrong for every
+    project which prefixes its tags — openssl publishes `openssl-3.6.3`, curl
+    publishes `curl-8_21_0` — and a wrong guess does not degrade the answer, it
+    removes it: the diff reports the tag as unreadable and falls back to release
+    notes. The recipe's own source URL contains the tag, so read it rather than
+    guessing, exactly as the source repository itself is read.
+
+    One fetch per distinct recipe folder (one for most recipes, two for openssl),
+    and it yields the tag for *every* version at once, which is what both ends of
+    a diff need.
+    """
+    out: dict[str, str] = {}
+    for folder in sorted(set(folders.values())) or ["all"]:
+        text = fetch_file(
+            CONAN_INDEX_REPO, f"recipes/{name}/{folder}/conandata.yml", "master"
+        )
+        for ver, body in _version_blocks(_mapping_block(text, "sources")).items():
+            gh = _GITHUB_URL.search(body)
+            if not gh:
+                continue
+            # A mirror list can put other hosts first, so start from the GitHub
+            # match and take that URL whole.
+            url = re.search(r"https?://[^\s\"']+", body[gh.start():])
+            tag = _tag_from_url(url.group(0)) if url else ""
+            if tag:
+                out.setdefault(ver, tag)
+    return out
+
+
+def _recipe_conandata(name: str, version: str) -> tuple[str, str]:
+    """(path, text) of the `conandata.yml` that governs a pinned version.
+
+    Split out because the source repository and the patch set are two answers
+    from one file, and reading it twice per dependency was pure waste.
+    """
+    folders = _conan_folders(name)
+    # The catalogue is pruned rather than historical, so the pinned version is
+    # often already gone (the same fact `pin_unavailable` reports). The recipe is
+    # still the right file to read; only the per-version lookups inside it become
+    # unanswerable, and each of those says so for itself.
+    folder = folders.get(version) or next(iter(folders.values()), "all")
+    rel = f"recipes/{name}/{folder}/conandata.yml"
+    return rel, fetch_file(CONAN_INDEX_REPO, rel, "master")
+
+
+def conan_source_repo(name: str, version: str = "") -> tuple[str, str]:
+    """`owner/repo` the recipe takes its sources from, plus the evidence for it.
+
+    Returns `("", reason)` when the sources are not on GitHub. That is common
+    and not a failure: pkgconf ships from distfiles.ariadne.space, xz_utils from
+    tukaani.org, libiconv from a GNU mirror. Saying so is the honest answer, and
+    the caller reports the dependency as undiffable rather than unaffected.
+
+    The first URL is deliberately *not* the answer. Several recipes list a
+    mirror ahead of the canonical repository — zlib leads with zlib.net and
+    libcurl with curl.se — so the rule is the first URL that is a GitHub
+    repository, not the first URL.
+    """
+    rel, text = _recipe_conandata(name, version)
+    return _source_repo_from(rel, text, version)
+
+
+def _source_repo_from(rel: str, text: str, version: str) -> tuple[str, str]:
+    block = _mapping_block(text, "sources")
+    if not block:
+        return "", f"{rel} declares no sources, so there is no repository to read"
+
+    own = _version_block(block, version)
+    m = _GITHUB_URL.search(own) if own else None
+    if m:
+        return f"{m.group(1)}/{m.group(2)}", f"{rel} declares {m.group(0)} for {version}"
+    # Falling back to the rest of the mapping is the whole point when the pinned
+    # version has been pruned; the repository does not change per version.
+    m = _GITHUB_URL.search(block)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}", (
+            f"{rel} declares {m.group(0)} for another version of the recipe; "
+            f"{version or 'the pinned version'} is not in it"
+        )
+    return "", (
+        f"{rel} declares no GitHub source URL — this recipe builds from "
+        f"elsewhere, so its API surface cannot be diffed"
+    )
+
+
+_PATCH_ITEM = re.compile(r'^\s+-\s+patch_file:\s*"?([^"\n]+?)"?\s*$')
+_PATCH_FIELD = re.compile(r'^\s+(patch_description|patch_type):\s*"?(.*?)"?\s*$')
+
+
+def conan_recipe_patches(name: str, version: str) -> tuple[list[dict], bool]:
+    """Patches Conan Center applies to a recipe, and whether that answer is known.
+
+    This is the quiet half of "what actually ships". A Conan package is not
+    upstream's release even when nobody here has touched it: the recipe carries
+    its own patches and they are applied before the library is built. zlib 1.3.2
+    has one, libarchive 3.8.7 has several, openssl and libcurl have none. So an
+    upstream-derived claim — the header diff, the release notes, an advisory
+    match — is about a *nearby* artifact rather than the one that ships.
+
+    Returns `(patches, authoritative)`. `authoritative` is False when the pinned
+    version is no longer in the recipe, because an empty list then means "cannot
+    tell" rather than "none"; the pruned catalogue makes that common and the two
+    must not be reported the same way.
+    """
+    return _recipe_patches_from(_recipe_conandata(name, version)[1], version)
+
+
+def _recipe_patches_from(text: str, version: str) -> tuple[list[dict], bool]:
+    # The version must appear under `sources:` for its absence from `patches:` to
+    # mean anything. A recipe that never mentions it tells us nothing either way.
+    known = bool(_version_block(_mapping_block(text, "sources"), version))
+
+    out: list[dict] = []
+    for line in _version_block(_mapping_block(text, "patches"), version).splitlines():
+        item = _PATCH_ITEM.match(line)
+        if item:
+            out.append({"file": item.group(1), "description": "", "type": ""})
+            continue
+        field = _PATCH_FIELD.match(line)
+        if field and out:
+            key = "description" if field.group(1) == "patch_description" else "type"
+            out[-1][key] = field.group(2)
+    return out, known
+
+
+def patch_evidence(name: str, version: str, patches: list[dict], known: bool) -> str:
+    """One line for the report, or "" when there is nothing worth saying.
+
+    `patch_type` is a declared field, so the weighting reads it instead of
+    guessing: Conan marks build-system plumbing as `conan`, and a recipe whose
+    patches are all of that kind is much less likely to have moved the API than
+    one carrying an untyped or behavioural patch.
+    """
+    if not known:
+        return (
+            f"whether Conan Center patches {name} at {version} cannot be "
+            f"established — that version is no longer in the recipe, so what "
+            f"shipped is not reconstructible from the index"
+        )
+    if not patches:
+        return ""
+    kinds = {p["type"] for p in patches}
+    plumbing = kinds == {"conan"}
+    detail = "; ".join(p["description"] or p["file"] for p in patches[:3])
+    if len(patches) > 3:
+        detail += "; …"
+    weight = (
+        "all declared `patch_type: conan`, i.e. build-system plumbing rather than "
+        "behaviour" if plumbing else
+        "at least one is not declared as build-system plumbing, so it may change "
+        "behaviour"
+    )
+    return (
+        f"Conan Center applies {len(patches)} patch(es) to {name} {version} before "
+        f"building — {weight} — so what ships is not upstream's release: {detail}"
+    )
+
+
+def conan_recipe_facts(name: str, version: str) -> dict:
+    """Both answers the recipe holds, from one read of `conandata.yml`.
+
+    `check` wants the source repository *and* the patch set for the same
+    dependency, and they live in the same file — so this exists to stop that
+    being two fetches of it.
+    """
+    rel, text = _recipe_conandata(name, version)
+    repo, repo_why = _source_repo_from(rel, text, version)
+    patches, known = _recipe_patches_from(text, version)
+    return {
+        "repo": repo,
+        "repo_why": repo_why,
+        "patches": patches,
+        "patches_known": known,
+        "patch_why": patch_evidence(name, version, patches, known),
+    }
 
 
 def _repology_versions(name: str) -> list[dict]:

@@ -54,7 +54,7 @@ def _worth_diffing(dep: Dep, info: dict) -> bool:
     that still cannot produce a finding says so out loud.
     """
     return bool(
-        dep.upstream.kind == "github"
+        dep.diff_repo()
         and info.get("resolved")
         and info.get("behind_by")
         and not info.get("unpinned")
@@ -315,6 +315,23 @@ def cmd_check(args) -> int:
         # the header diff is factual, a migration guide is upstream's own
         # warning, and the commit log only stands in when there are no notes.
         change: dict = {}
+        # A Conan recipe name is not a repository, so until this ran the header
+        # diff — the tool's central mechanism — could not run on a Conan-pinned
+        # dependency at all. It costs two fetches, so resolve only when there is
+        # a bump for the diff to be about.
+        source_why = ""
+        # Deliberately not gated on `behind_by`. The source repository is only
+        # needed for a diff, but "what ships is not upstream's release" is a fact
+        # about a *current* dependency too — libarchive 3.8.7 is the live case —
+        # and one read of the recipe answers both, so gating it would hide a
+        # finding to save nothing.
+        if dep.upstream.kind == "conan" and info.get("resolved"):
+            facts = upstream.conan_recipe_facts(
+                dep.upstream.ref, info.get("current") or ""
+            )
+            dep.upstream.source_repo, source_why = facts["repo"], facts["repo_why"]
+            if facts["patch_why"] and facts["patch_why"] not in dep.patched:
+                dep.patched.append(facts["patch_why"])
         if not args.no_api_diff and _worth_diffing(dep, info):
             versions = list(info.get("available") or [])
             if info.get("current_tag"):
@@ -334,13 +351,19 @@ def cmd_check(args) -> int:
                     dep, info["current"], info["latest"], versions,
                     max_headers=args.max_headers, root=root,
                 )
+            if source_why:
+                api.setdefault("notes", []).append(source_why)
             change["api_diff"] = api
             if api.get("resolved"):
                 change.update(upstream.change_prose(
-                    dep.upstream.ref, api["from_ref"], api["to_ref"],
+                    dep.diff_repo(), api["from_ref"], api["to_ref"],
                     companion.notes_for(info["latest"], info.get("available")),
                     api["doc_candidates"],
                 ))
+        elif source_why and not dep.upstream.source_repo:
+            # The recipe resolved to no repository. Report that, because going
+            # quiet here reads exactly like a diff that found nothing.
+            change["api_diff"] = {"resolved": False, "reason": source_why}
 
         findings.append({
             "name": dep.name,
@@ -362,6 +385,9 @@ def cmd_check(args) -> int:
             "call_depth": dep.call_depth,
             "notes": dep.notes,
             "scope_evidence": dep.scope_evidence,
+            # Why what ships is not upstream's release. Non-empty means every
+            # upstream-derived claim below is about a nearby artifact.
+            "patched": dep.patched,
             "companion_pins": [p.render() for p in dep.companion_pins],
             "companions": companions,
             "assessment": dep.assessment,
@@ -381,6 +407,10 @@ def cmd_check(args) -> int:
             # the branches below bail out.
             if f.get("divergence"):
                 print(f"!= {f['name']:<16} {f['divergence']}")
+            # Also independent of upstream: it changes how much every claim
+            # below is worth, so it cannot sit behind the bail-outs.
+            for ev in f.get("patched") or []:
+                print(f"/= {f['name']:<16} {ev}")
             if not up.get("resolved"):
                 print(f"?  {f['name']:<16} {up.get('reason','unresolved')}")
                 continue
@@ -435,6 +465,16 @@ def cmd_apidiff(args) -> int:
         # a bare list of upstream removals is what a changelog already is.
         backends.analyse(args.root, [dep])
 
+    # Same reason as in `check`: the recipe name has to become a repository
+    # before there is anything to diff, and the same read also says whether what
+    # ships is upstream's release.
+    source_why = ""
+    if dep.upstream.kind == "conan":
+        facts = upstream.conan_recipe_facts(dep.upstream.ref, dep.version)
+        dep.upstream.source_repo, source_why = facts["repo"], facts["repo_why"]
+        if facts["patch_why"] and facts["patch_why"] not in dep.patched:
+            dep.patched.append(facts["patch_why"])
+
     versions = upstream.fetch_versions(dep)
     target = args.to
     if not target:
@@ -448,10 +488,14 @@ def cmd_apidiff(args) -> int:
         dep, args.from_version or dep.version, target, versions,
         max_headers=args.max_headers, root=args.root,
     )
+    if source_why:
+        result.setdefault("notes", []).append(source_why)
 
     def human(r):
         if not r["resolved"]:
             print(f"{dep.name}: {r['reason']}")
+            if source_why:
+                print(f"  ! {source_why}")
             return
         print(f"{dep.name} {r['from_version']} -> {r['to_version']} "
               f"({r['repo']} {r['from_ref']}...{r['to_ref']})")

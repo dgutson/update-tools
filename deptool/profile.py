@@ -90,6 +90,7 @@ def render(deps: list[Dep], root: str, meta: dict) -> str:
         ])
         lines += _fmt_list("companion-pins", [p.render() for p in dep.companion_pins])
         lines += _fmt_list("scope-evidence", dep.scope_evidence)
+        lines += _fmt_list("patched", dep.patched)
         lines += _fmt_list("notes", dep.notes)
         lines.append(
             f"- fingerprint: decl={fp['decl']} sites={fp['sites']} pin={fp['pin']}"
@@ -209,6 +210,8 @@ def _append(dep: Dep, key: str, item: str) -> None:
             dep.companion_pins.append(pin)
     elif key == "scope-evidence":
         dep.scope_evidence.append(item)
+    elif key == "patched":
+        dep.patched.append(item)
     elif key == "notes":
         dep.notes.append(item)
 

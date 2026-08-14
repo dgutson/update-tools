@@ -171,6 +171,38 @@ Recommend regenerating the lock, never editing it; `apply` will not touch a
 generated file, and after a bump it reports which ones still record the old
 version.
 
+### `patched` weakens every upstream-derived claim about that dependency
+
+A non-empty `patched` field says **what ships is not upstream's release**, with
+the evidence for it. That comes from three places, and the wording tells you
+which: a `PATCH_COMMAND` declared in the build files, a tracked diff in the
+repository against the dependency's recipe (typically a CI script), or the Conan
+Center recipe's *own* patches, which apply even when nobody here has touched
+anything.
+
+It does not change the ranking, and it is not a reason to avoid an upgrade. What
+it changes is **confidence**, and you must say so explicitly rather than quietly
+discounting:
+
+- The header diff read *upstream's* headers. On a patched dependency it is
+  evidence about a nearby artifact, not proof about the one that builds here. The
+  diff's own `notes` will say this too — repeat it rather than presenting the diff
+  as settled.
+- The same applies to release notes and to an advisory match: a patch can have
+  already fixed, or introduced, what the advisory describes.
+- **Read the weighting the evidence gives you.** Conan marks build-system
+  plumbing as `patch_type: conan`; when the line says all the patches are of that
+  kind, the API is very unlikely to have moved and you can say so. When it says at
+  least one is not, treat the surface as genuinely uncertain.
+- **"Cannot be established" is not "none".** When the pinned version is gone from
+  the recipe, the patch set that built it is unrecoverable from the index. Report
+  that as unknown.
+
+A locally patched dependency is also a finding in its own right, independent of
+any upgrade: the patch is a modification nobody upstream knows about, it has to be
+re-applied on every bump, and the reason for it is usually undocumented. Raise it
+once, with the `file:line`.
+
 ### Two notes that change what a finding means
 
 - **`transitive`** — only a lockfile or an ingested scanner records this
