@@ -6,3 +6,5 @@ __pycache__/
 *.deptool.bak
 .claude/settings.local.json*
 HANDOFF.md
+graphify-out/
+.codebase-memory/
