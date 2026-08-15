@@ -565,16 +565,205 @@ def test_graphify_prefers_call_edges_over_references(tmp_path):
     assert dep.call_depth == 1
 
 
+# ------------------------------------------------------- codebase-memory
+
+
+def test_cbmem_rows_reads_by_column_not_by_scraping():
+    """The regression that made this backend report column headers as symbols.
+
+    `search_graph` and `trace_path` answer with positional rows under a `cols`
+    header. An earlier reader walked the JSON for any `name`/`label` key, so it
+    harvested the words `Function` and `Method` out of the table itself and
+    reported them as functions reaching zlib.
+    """
+    from deptool.backends import _cbmem_rows
+
+    table = {
+        "cols": ["name", "label", "lines", "in", "out"],
+        "groups": [
+            {"qn_prefix": "app.archive.z_stream.ZStream",
+             "file": "archive/z_stream.cpp",
+             "rows": [["compress", "Method", "72-147", 1, 7]]},
+        ],
+    }
+    rows = _cbmem_rows(table)
+    assert [qn for qn, _, _ in rows] == ["app.archive.z_stream.ZStream.compress"]
+    assert [path for _, path, _ in rows] == ["archive/z_stream.cpp"]
+    assert rows[0][2]["lines"] == "72-147"
+    # The header words are not data.
+    assert "Function" not in [qn for qn, _, _ in rows]
+    assert "Method" not in [qn for qn, _, _ in rows]
+
+
+def test_cbmem_rows_drops_rows_that_are_not_the_declared_shape():
+    """A row of the wrong width is not guessed at."""
+    from deptool.backends import _cbmem_rows
+
+    table = {
+        "cols": ["name", "label", "lines"],
+        "groups": [{"qn_prefix": "app", "file": "a.cpp", "rows": [
+            ["good", "Method", "1-9"],
+            ["short", "Method"],
+            ["long", "Method", "1-9", "extra"],
+        ]}],
+    }
+    assert [qn for qn, _, _ in _cbmem_rows(table)] == ["app.good"]
+
+
+def test_enclosing_cbmem_requires_real_containment():
+    """An explicit end line means a site in a gap is unlocated, not attributed.
+
+    This is the one place the two backends genuinely differ: graphify has no end
+    line and takes the nearest declaration above, which would hand line 60 to
+    `first` below.
+    """
+    from deptool.backends import _enclosing_cbmem
+
+    defs = {"a.cpp": [(10, 20, "app.first"), (30, 90, "app.outer"), (40, 50, "app.inner")]}
+    assert _enclosing_cbmem(defs, "a.cpp", 15) == "app.first"
+    assert _enclosing_cbmem(defs, "a.cpp", 35) == "app.outer"
+    assert _enclosing_cbmem(defs, "a.cpp", 45) == "app.inner"   # innermost wins
+    assert _enclosing_cbmem(defs, "a.cpp", 25) is None          # a gap, not `first`
+    assert _enclosing_cbmem(defs, "b.cpp", 15) is None
+
+
+def test_cbmem_calls_parses_quoted_fields(monkeypatch):
+    """C++ qualified names contain spaces, and the table quotes them."""
+    from deptool import backends
+
+    table = (
+        'rows: 3  (cols: src dst strat)\n'
+        '  app.A.run app.B.helper lsp_direct\n'
+        '  app.C.go "app.tod.TOD.RValueAssigner.operator std::string" suffix_match\n'
+        '  app.D.bad only_two_fields\n'
+        'total: 3\n'
+    )
+    monkeypatch.setattr(backends, "_cbmem_run", lambda *a, **k: table)
+    callers, how = backends._cbmem_calls("exe", "/root", "proj")
+
+    assert callers["app.B.helper"] == {"app.A.run"}
+    # The quoted name survives intact rather than splitting into three targets.
+    assert callers["app.tod.TOD.RValueAssigner.operator std::string"] == {"app.C.go"}
+    assert how[("app.A.run", "app.B.helper")] == "lsp_direct"
+    # A row that does not match the declared column count is dropped.
+    assert "only_two_fields" not in callers
+
+
+def test_cbmem_index_reports_a_failure_instead_of_swallowing_it(monkeypatch, capsys):
+    """The R-002 bug: a rejected flag exited 1 and was read as success.
+
+    Because the return code was discarded, every later query ran against an
+    unindexed project and the enricher returned False having contributed
+    nothing — indistinguishable from the backend not being installed.
+    """
+    from deptool import backends
+
+    monkeypatch.setattr(backends, "_cbmem_run", lambda *a, **k: None)
+    assert backends._cbmem_index("cbmem", "/root") is None
+    assert "indexing failed" in capsys.readouterr().err
+
+
+def test_cbmem_index_uses_the_name_the_tool_stored(monkeypatch):
+    """`--name` normalises unsafe characters, so the answer is read back."""
+    from deptool import backends
+
+    monkeypatch.setattr(backends, "_cbmem_run",
+                        lambda *a, **k: '{"project": "my-repo", "nodes": 10}')
+    assert backends._cbmem_index("cbmem", "/tmp/my repo") == "my-repo"
+
+
+def test_cbmem_seeds_from_sites_never_from_symbol_names(monkeypatch, tmp_path):
+    """Standing rule 3, and the reason this backend was disabled.
+
+    The dependency's own symbols are never nodes — codebase-memory indexes only
+    our repository — so a symbol-name match can only ever be one of our own
+    homonyms. Here `compress` is both zlib's symbol and one of our methods; the
+    radius must come from the function containing the site, not from the name.
+    """
+    from deptool import backends
+
+    monkeypatch.setattr(backends, "_codebase_memory_exe", lambda: "cbmem")
+    monkeypatch.setattr(backends, "_cbmem_index", lambda exe, root: "proj")
+    monkeypatch.setattr(backends, "_cbmem_defs", lambda exe, root, proj: {
+        "archive/z_stream.cpp": [(72, 147, "proj.archive.z_stream.ZStream.compress")],
+        "elsewhere.cpp": [(1, 9, "proj.elsewhere.compress")],
+    })
+    monkeypatch.setattr(backends, "_cbmem_calls", lambda exe, root, proj: (
+        {"proj.archive.z_stream.ZStream.compress": {"proj.archive.postprocess"}},
+        {("proj.archive.postprocess", "proj.archive.z_stream.ZStream.compress"): "lsp_direct"},
+    ))
+
+    dep = Dep(
+        name="zlib", kind="conan", consumed=["compress", "deflate"],
+        sites=[
+            Site(path="archive/z_stream.cpp", line=2, symbol="zlib.h", context="include"),
+            Site(path="archive/z_stream.cpp", line=109, symbol="deflate", context="call"),
+        ],
+    )
+    assert backends._enrich_codebase_memory(str(tmp_path), [dep]) is True
+    # The seed plus its one caller. `proj.elsewhere.compress` shares the symbol
+    # name and is correctly not counted.
+    assert dep.blast_radius == 2
+    assert dep.call_depth == 1
+    assert any("seeded from 1 of 1 located site" in n for n in dep.notes)
+    assert not any("elsewhere" in n for n in dep.notes)
+
+
+def test_cbmem_says_so_when_no_site_could_be_located(monkeypatch, tmp_path):
+    """Standing rule 4: unmeasured must not render as unaffected.
+
+    Measured on the development case: openssl has 14 sites and locates none of
+    them, because the index recorded its class without method nodes. Saying
+    nothing would leave it looking like a dependency nothing reaches.
+    """
+    from deptool import backends
+
+    monkeypatch.setattr(backends, "_codebase_memory_exe", lambda: "cbmem")
+    monkeypatch.setattr(backends, "_cbmem_index", lambda exe, root: "proj")
+    monkeypatch.setattr(backends, "_cbmem_defs", lambda exe, root, proj: {"other.cpp": [(1, 5, "proj.x")]})
+    monkeypatch.setattr(backends, "_cbmem_calls", lambda exe, root, proj: ({}, {}))
+
+    dep = Dep(
+        name="openssl", kind="conan", consumed=["BIO_free"],
+        sites=[Site(path="sig.h", line=58, symbol="BIO_free", context="call")],
+    )
+    assert backends._enrich_codebase_memory(str(tmp_path), [dep]) is False
+    assert dep.blast_radius is None          # criterion 6: unset, not zero
+    assert any("unmeasured here, not zero" in n for n in dep.notes)
+
+
+def test_cbmem_grades_edges_resolved_by_name(monkeypatch, tmp_path):
+    """codebase-memory's edge strategies separate type resolution from guesses."""
+    from deptool import backends
+
+    monkeypatch.setattr(backends, "_codebase_memory_exe", lambda: "cbmem")
+    monkeypatch.setattr(backends, "_cbmem_index", lambda exe, root: "proj")
+    monkeypatch.setattr(backends, "_cbmem_defs", lambda exe, root, proj: {
+        "a.cpp": [(1, 20, "proj.seed")],
+    })
+    monkeypatch.setattr(backends, "_cbmem_calls", lambda exe, root, proj: (
+        {"proj.seed": {"proj.byType", "proj.byName"}},
+        {("proj.byType", "proj.seed"): "lsp_direct",
+         ("proj.byName", "proj.seed"): "suffix_match"},
+    ))
+
+    dep = Dep(name="libcurl", kind="conan", consumed=["curl_easy_init"],
+              sites=[Site(path="a.cpp", line=5, symbol="curl_easy_init", context="call")])
+    assert backends._enrich_codebase_memory(str(tmp_path), [dep]) is True
+    assert dep.blast_radius == 3
+    assert any("1 of 2 direct edge(s) resolved by name" in n for n in dep.notes)
+
+
 # ------------------------------------------------------------ backend merging
 
 
 def test_backends_are_additive_not_first_wins(monkeypatch, tmp_path):
     """Two backends covering different deps must both land.
 
-    graphify resolves the C ABI but is blind to namespaced C++; codebase-memory
-    claims the opposite. An earlier version `break`ed after the first backend
-    that returned anything, so graphify's partial result suppressed the other
-    entirely.
+    Both parse C and C++; what codebase-memory adds is type resolution, so the
+    two see overlapping but different slices of the same tree. An earlier version
+    `break`ed after the first backend that returned anything, so graphify's
+    partial result suppressed the other entirely.
     """
     from deptool import backends
 
@@ -2279,6 +2468,172 @@ def test_requirements_is_the_fallback_per_directory_not_per_repository(tmp_path)
     assert names == {"httpx", "deepdiff"}
     assert "ignored-mirror" not in names
     assert next(d for d in deps if d.name == "deepdiff").declared_in == "tool/requirements.txt:1"
+
+
+_PYPROJECT = """\
+[build-system]
+requires = ["hatchling"]
+
+[project]
+name = "demo"
+description = "a tool (with parens) in its description"
+dependencies = [
+    # the http client
+    "requests>=2.31.0",
+    "urllib3==2.0.7",   # pinned deliberately
+    "attrs==2.0.7",
+    "httpx",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "coverage==7.6.1"]
+docs = [
+    "sphinx==7.4.0",
+]
+
+[tool.ruff]
+note = "see PEP 508 (extras) for the syntax"
+"""
+
+
+def test_pyproject_records_the_declaration_line(tmp_path):
+    """`tomllib` discards positions, and a declaration with no line is one
+    `apply` may not edit — so every pyproject dependency was report-only."""
+    from deptool import discover
+
+    (tmp_path / "pyproject.toml").write_text(_PYPROJECT)
+    deps = {d.name: d for d in discover._pyproject(str(tmp_path), "pyproject.toml")}
+
+    assert deps["requests"].declared_in == "pyproject.toml:9"
+    assert deps["urllib3"].declared_in == "pyproject.toml:10"
+    assert deps["attrs"].declared_in == "pyproject.toml:11"
+    assert deps["httpx"].declared_in == "pyproject.toml:12"
+    # An inline array puts both requirements on the one line they are written on.
+    assert deps["pytest"].declared_in == "pyproject.toml:16"
+    assert deps["coverage"].declared_in == "pyproject.toml:16"
+    assert deps["sphinx"].declared_in == "pyproject.toml:18"
+    assert deps["pytest"].scope == "test"
+
+
+def test_pyproject_pin_is_editable(tmp_path):
+    """The point of the line: `plan` can now edit a pyproject pin at all."""
+    from deptool import discover
+
+    (tmp_path / "pyproject.toml").write_text(_PYPROJECT)
+    deps = {d.name: d for d in discover._pyproject(str(tmp_path), "pyproject.toml")}
+    deps["urllib3"].ensure_declaration()
+    assert deps["urllib3"].declarations[0].is_editable()
+
+    planned = apply_plan(str(tmp_path), deps["urllib3"], "2.2.3")
+    assert '+    "urllib3==2.2.3",   # pinned deliberately' in planned["diff"]
+
+
+def test_pyproject_bump_leaves_a_sibling_on_the_same_version_alone(tmp_path):
+    """`attrs` is pinned to the same version one line below. The span rule is
+    what stops one bump from rewriting both."""
+    from deptool import discover
+
+    (tmp_path / "pyproject.toml").write_text(_PYPROJECT)
+    deps = {d.name: d for d in discover._pyproject(str(tmp_path), "pyproject.toml")}
+
+    planned = apply_plan(str(tmp_path), deps["urllib3"], "2.2.3")
+    updated = planned["edits"][0]["_text"]
+    assert '"urllib3==2.2.3"' in updated
+    assert '"attrs==2.0.7"' in updated
+    assert "(with parens)" in updated
+    assert "PEP 508 (extras)" in updated
+
+
+def test_pyproject_without_a_locatable_line_stays_report_only(tmp_path):
+    """A shape the scan cannot reproduce — here a `\\uXXXX` escape, so the raw
+    text and the parsed value differ — degrades to what it was, report-only
+    with a note, rather than to a guessed position `apply` would edit.
+
+    Its neighbour on the same line is still located, so one unreadable spec
+    does not cost the rest of the array.
+    """
+    from deptool import discover
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\n'
+        'dependencies = ["requests\\u003E=2.31.0", "attrs==1.0"]\n'
+    )
+    deps = {d.name: d for d in discover._pyproject(str(tmp_path), "pyproject.toml")}
+    assert deps["requests"].declared_in == "pyproject.toml (project.dependencies)"
+    assert any("report-only" in n for n in deps["requests"].notes)
+    assert deps["attrs"].declared_in == "pyproject.toml:3"
+
+    deps["requests"].ensure_declaration()
+    with pytest.raises(Exception) as exc:
+        apply_plan(str(tmp_path), deps["requests"], "2.32.0")
+    assert "report-only" in str(exc.value)
+
+
+def test_pyproject_line_is_checked_against_the_parsed_value(tmp_path):
+    """Agreeing on the count is not agreeing on the string. A duplicate pin
+    must land on its own line rather than collapsing onto the first."""
+    from deptool import discover
+
+    (tmp_path / "pyproject.toml").write_text(
+        textwrap.dedent(
+            """\
+            [project]
+            name = "demo"
+            dependencies = [
+                "alpha==1.0",
+                "beta==1.0",
+                "alpha==1.0",
+            ]
+            """
+        )
+    )
+    lines = [d.declared_in for d in discover._pyproject(str(tmp_path), "pyproject.toml")]
+    assert lines == ["pyproject.toml:4", "pyproject.toml:5", "pyproject.toml:6"]
+
+
+def test_a_ranged_requirement_is_refused_rather_than_flattened(tmp_path):
+    """`httpx>=0.27,<1` reaches `apply` as the version `0.27,<1`, and a swap
+    would rewrite the whole requirement to a bare pin — dropping the upper
+    bound without saying so. Observed on a real project once pyproject pins
+    became editable at all.
+    """
+    from deptool import discover
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndependencies = ["httpx>=0.27,<1"]\n'
+    )
+    dep = discover._pyproject(str(tmp_path), "pyproject.toml")[0]
+    dep.ensure_declaration()
+    assert dep.declared_in == "pyproject.toml:3"  # located, just not bumpable
+
+    with pytest.raises(Exception) as exc:
+        apply_plan(str(tmp_path), dep, "0.28.0")
+    assert "is a range, not a pin" in str(exc.value)
+    assert '"httpx>=0.27,<1"' in (tmp_path / "pyproject.toml").read_text()
+
+
+def test_declaration_span_of_a_line_oriented_format_is_one_line():
+    """Scanning forward for a `(` used to reach an unrelated table further down
+    the file, so the span swallowed every declaration in between."""
+    text = textwrap.dedent(
+        """\
+        dependencies = [
+            "requests>=2.0",
+            "attrs>=2.0",
+        ]
+
+        [tool.mypy]
+        note = "see RFC (section 2.0) for why"
+        """
+    )
+    lo, hi = _declaration_span(text, 2)
+    assert text[lo:hi] == '    "requests>=2.0",\n'
+
+
+def test_declaration_span_survives_an_unbalanced_paren():
+    text = 'foo>=1.0  # see (the note\nbar>=1.0\n'
+    lo, hi = _declaration_span(text, 1)
+    assert text[lo:hi] == "foo>=1.0  # see (the note\n"
 
 
 def test_a_manifest_we_cannot_read_is_still_listed(tmp_path):

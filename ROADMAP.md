@@ -42,46 +42,6 @@ breaking it produced a wrong answer.
 
 ## Now
 
-### R-002 — Fix the codebase-memory invocation and the false backend docstrings
-
-- **Category:** Graph backends
-- **What:** In `deptool/backends/__init__.py:264`, change `index_repository --path R
-  --project P` to `--repo-path R --name P`, and check the return code instead of
-  discarding it. Correct two claims in the module docstring: line 9 ("Graphify
-  resolves the C ABI but cannot see namespaced C++") and lines 116-118 ("Graphify
-  emits the dependency's own symbols as nodes"), and the same claim repeated in the
-  `test_backends_merge_additively` docstring. Then give the enricher a site-based
-  seed as `_enrich_graphify` now has, fix `_collect_names` (it scrapes the table
-  headers `Function` and `Method` out of the tool's output and reports them as
-  function names), and flip `CODEBASE_MEMORY_ENABLED` back on.
-- **Why:** `--project` is rejected outright with `unknown flag`, and because the
-  return code is discarded the failure is silent: every subsequent `trace_path` then
-  queries an unindexed project, so the enricher returns `False` having contributed
-  nothing. codebase-memory could never have worked, even once installed. Both
-  docstring claims were written from published docs rather than measurement and are
-  contradicted by `extract.py:858` and by the seed measurement in R-001.
-- **Outcome:** `codebase-memory` indexes successfully when installed, a failed index
-  is reported rather than swallowed, the module docstring describes what the backends
-  actually do, and the enricher contributes again — seeded from sites, never from
-  symbol names.
-- **Blocked-by:** —
-- **Enables:** R-014
-
-### R-003 — Record declaration lines for pyproject dependencies
-
-- **Category:** Python
-- **What:** Add a line-recording scan of `pyproject.toml` beside the `tomllib` parse
-  in `deptool/discover._pyproject`, so each `Dep.declared_in` carries `path:line`
-  rather than a table name.
-- **Why:** `declared_in` is currently `"pyproject.toml (project.dependencies)"` — a
-  table name with no line — so by the report-only rule every pyproject dependency is
-  unappliable and `apply` cannot touch it. `tomllib` discards positions, so the parse
-  alone cannot supply this.
-- **Outcome:** Every dependency declared in a `pyproject.toml` has a line number and
-  is appliable by `plan`/`apply`.
-- **Blocked-by:** —
-- **Enables:** —
-
 ### R-004 — Read Poetry manifests
 
 - **Category:** Python
@@ -90,7 +50,9 @@ breaking it produced a wrong answer.
   value is either a string or a `{version, extras, markers, optional}` dict; the
   `python` key is a marker, not a dependency. `_PY_REQ` also cannot parse Poetry's
   caret/tilde operators (`^2.0`, `~1.4`) — `_cargo` already strips these at
-  `discover.py:200`.
+  `discover.py:200`. R-003's `_toml_array_strings` will not locate these lines: it
+  reads strings inside `key = [ ... ]`, and a Poetry entry is a `name = "..."`
+  assignment under a table. Extend that scan rather than writing a second one.
 - **Why:** Poetry's tables are not read at all, so a Poetry project reports **zero
   dependencies**. That is a wrong answer, not a coverage gap, and it is the loudest
   failure in the tool.
@@ -105,10 +67,14 @@ breaking it produced a wrong answer.
 
 - **Category:** Python
 - **What:** Read the `[dependency-groups]` table in `deptool/discover._pyproject`.
+  Its groups are arrays of requirement strings, the same shape `project.dependencies`
+  has, so R-003's `_toml_array_strings` already locates their lines — this is one
+  more entry in `arrays` plus the `{include-group = "..."}` inline table, which is a
+  reference to another group rather than a dependency.
 - **Why:** It is the modern standard, what `uv` uses, and what this repo's own
   `pyproject.toml` uses — so the tool currently reports zero dependencies for itself.
 - **Outcome:** Projects using PEP 735 groups, including this one, report their
-  dependencies with scopes.
+  dependencies with scopes, with a line each.
 - **Blocked-by:** —
 - **Enables:** —
 
@@ -118,10 +84,17 @@ breaking it produced a wrong answer.
 - **What:** Stop `_PY_REQ` (`deptool/discover.py:210`) taking the first specifier and
   stripping its operator, and carry the full constraint through `Dep.version` /
   `Dep.raw_pin`.
-- **Why:** `>=2.0,<3` becomes `2.0` — a floor read as a pin. Ranges are the norm in
-  Python, so this mismeasures "how far behind" far more often than in CMake.
-- **Outcome:** A ranged Python constraint is reported as a range, and "how far behind"
-  is measured against the range's ceiling rather than its floor.
+- **Why:** `>=2.0,<3` becomes `2.0,<3`, not `2.0` as this entry used to claim —
+  `lstrip` removes the leading operator and leaves the whole tail, so `version` is
+  neither a version nor a usable range. Ranges are the norm in Python, so this
+  mismeasures "how far behind" far more often than in CMake. Since R-003 made these
+  pins editable, `apply` **refuses** any version still carrying an operator rather
+  than rewriting `httpx>=0.27,<1` to `httpx>=9.9.9` and dropping the upper bound
+  silently; that guard is what this item replaces with a real answer. npm's
+  `lstrip("^~>=< ")` produces the same shape and is fixed by the same change.
+- **Outcome:** A ranged constraint is reported as a range, "how far behind" is
+  measured against its ceiling rather than its floor, and a ranged pin can be bumped
+  instead of refused.
 - **Blocked-by:** —
 - **Enables:** —
 
@@ -246,12 +219,14 @@ breaking it produced a wrong answer.
 - **What:** Run `backends.analyse` with both graphify and codebase-memory present and
   confirm the largest-wins rule in `_record` behaves.
 - **Why:** The merge has never run with two live backends — until 2026-08-14 only one
-  was installed on the dev machine — so the largest-wins rule is untested in anger. It
-  cannot be meaningfully tested until R-001 makes either backend produce a correct
-  number.
+  was installed on the dev machine — so the largest-wins rule is untested in anger.
+  Both now produce correct numbers separately, and the 2026-08-15 comparison makes
+  this sharper than a smoke test: they locate *different* site populations
+  (graphify 12/12 on libarchive where codebase-memory gets 2/12; the reverse on
+  zlib), so largest-wins is picking between answers of genuinely different coverage.
 - **Outcome:** Two backends run together against one tree and the merged
   `blast_radius` is defensible against both sources of evidence.
-- **Blocked-by:** R-002
+- **Blocked-by:** —
 - **Enables:** —
 
 ### R-015 — Evaluate the graph backends against zeta-daw

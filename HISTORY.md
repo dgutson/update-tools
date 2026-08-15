@@ -28,6 +28,64 @@ throughout the code comments.
 
 Newest first. Retired from ROADMAP.md; the ID is never reused.
 
+### 2026-08-15
+
+- **R-003** `pyproject.toml` dependencies carry a `path:line` and are editable.
+  A line-recording scan runs beside the `tomllib` parse and hands back every
+  string in every array with its line; `_pyproject` then takes the line **by
+  index and checks the scanned text against the parsed value**, because
+  agreeing on the count is not agreeing on the string and a line holding a
+  *different* requirement is worse than no line — `apply` would bump whichever
+  dependency happened to share the version. A spec the scan cannot reproduce
+  (a `\uXXXX` escape) falls back to an unambiguous match by value and then to
+  0, which leaves that one declaration report-only with a note while its
+  neighbours on the same line are still located. Measured against **24 real
+  `pyproject.toml` files on this machine, 112 dependencies: 112 located**, and
+  every recorded line verifiably contains its requirement. Through `plan`:
+  90 bump cleanly, 21 are declared with no constraint to move, 1 is refused
+  (below). Before this, *every* pyproject dependency raised `report-only — the
+  only record of it is pyproject.toml`. **Two findings beyond the item**, both
+  from running it:
+  - **`declaration_span` was CMake-shaped and would have made the bump edit the
+    wrong lines.** It scanned forward for the first `(` *anywhere after* the
+    recorded line, so on a line-oriented file the span ran from the dependency
+    to some unrelated parenthesis further down: bumping `requests` also
+    rewrote `attrs` on the next line and a `2.0` inside a `[tool.mypy]` string.
+    It now decides from what the recorded line *starts with* — a command
+    invocation gets the balanced span, everything else gets its own line, and
+    an unbalanced paren falls back to the line rather than to the end of file.
+    Latent for `requirements.txt`, `go.mod` and `conanfile.txt` too, and it
+    only ever bit where a stray `(` sat below the declaration. It also gives
+    Python dependencies a *meaningful* `decl` fingerprint for the first time —
+    the old one hashed the whole file for want of a line — so an existing
+    `CLAUDE_DEPS.md` for a Python project reports drift once, and regenerating
+    it is the whole fix.
+  - **A range is refused rather than flattened.** `httpx>=0.27,<1` reaches
+    `apply` as the version `0.27,<1` — the roadmap said `2.0`, which is wrong,
+    it is the whole tail — and swapping that produced `httpx>=9.9.9`,
+    *silently dropping the upper bound*. Observed on a real project, and only
+    reachable because this item made pyproject pins editable at all. `plan`
+    now refuses any version still carrying an operator, in any ecosystem
+    (npm's `lstrip` leaves the same shape). Carrying ranges through as ranges
+    is R-006; refusing is what can be done honestly until then.
+  Also: the unpinned-dependency error told a Python user to "update it through
+  the OS package manager", which is right for `find_package(CURL)` and a
+  confidently wrong answer to a different question for a `pypi` record.
+- **R-002** Fixed the codebase-memory backend and turned it back on. The invocation
+  now uses `--repo-path`/`--name` and **checks the return code** — the old flags exit
+  1 with `unknown flag --path`, which was discarded, so a failed index was
+  indistinguishable from an absent backend. The enricher is re-seeded from call
+  sites, and its response parsing reads the documented `cols`/`groups` envelope by
+  column instead of scraping any `name`-ish key, which is what turned the table's own
+  headers into `zlib: 3 — Function, Method, compress`. On `endpoint/appv2` it now
+  reports libcurl 77, zlib 4, libarchive 2, in 8.5s. Two corrections beyond the
+  item: the module docstring's claim that graphify "cannot see namespaced C++" is
+  false and was repeated in a test docstring, and a dependency that locates *no*
+  site now says so rather than silently producing nothing. **The item's premise was
+  partly wrong** — codebase-memory does not simply beat graphify at site location;
+  it is worse on four of five dependencies. Measured in
+  [Both backends compared on the same tree](#both-backends-compared-on-the-same-tree--2026-08-15).
+
 ### 2026-08-14
 
 - **R-001** Re-seed blast radius from the enclosing function — `_enrich_graphify` now
@@ -1024,6 +1082,72 @@ better spent widening those than adding entries to a table.
 
 ---
 
+## Both backends compared on the same tree — 2026-08-15
+
+R-002 predicted that fixing codebase-memory would make it the better backend,
+because 2026-08-14 found graphify emitting no callable node for the out-of-line
+methods in `archive/z_stream.cpp`. Running both against `endpoint/appv2` with
+identical site input shows that prediction holds **only for that one shape**.
+
+Sites located, and the resulting radius (non-`include` sites only):
+
+| dep | graphify | codebase-memory |
+|---|---|---|
+| libarchive | **12/12** → 7 | 2/12 → 2 |
+| libcurl | **12/12** → 31 | 7/12 → **77** |
+| libiconv | **3/3** → 1 | 0/3 → unmeasured |
+| openssl | **11/12** → 6 | 0/12 → unmeasured |
+| zlib | 3/8 → 1 | **5/8** → **4** |
+
+**Neither dominates, and they fail differently.** codebase-memory wins exactly
+where 2026-08-14 predicted — `zlib`, whose sites sit in `ZStream::compress`, an
+out-of-line method of a *top-level* class, which it records at
+`archive/z_stream.cpp:72-147` and graphify does not record at all. But the same
+gap reappears one level down: for a **nested** class it attributes the member to
+the header *declaration* and emits nothing spanning the definition body, so
+`LibarchiveBasedArchive::ArchiveEntry::ArchiveEntry` exists only at
+`libarchive_based_archive.h`, and all ten sites in `archive/archive_entry.cpp`
+land in no callable. That file's entire graph contribution is three macros and a
+module node. graphify locates all twelve.
+
+openssl locates nothing for a third reason: the index records
+`Class SignatureVerifier` (38-96) with no method nodes inside it, so its members
+are not in the graph at any location.
+
+Where it does locate, its radius is larger and better founded — libcurl 77
+against graphify's 31, from 3× the edges (100370 vs 32612). So the two answer
+different fractions of the same question, which is the case for keeping the
+additive merge rather than picking a winner.
+
+**One caveat on the comparison.** graphify's higher location rate is partly an
+artefact of a looser rule: with no end line it takes the nearest declaration
+*above* the site, so it will attribute a site in a gap to whatever precedes it.
+codebase-memory reports an explicit range and is tested for real containment, so
+it returns nothing rather than the function above. Some of graphify's 12/12 is
+therefore confidence rather than coverage — untested either way, and worth
+checking before treating its location rate as strictly better.
+
+### Cost, and why this reads the graph in bulk
+
+Every CLI call pays a daemon start-up: **3.7s cold, 1.25s warm**. Seeding
+per site via `trace_path` — the shape the old code implied — costs one call per
+seed and would have run to minutes on appv2. Instead the whole graph is pulled in
+a fixed handful of calls (`search_graph` returned all 3712 methods in 1.3s;
+`query_graph` all 10046 CALLS edges in 2.9s) and walked in memory with the same
+`_reverse_bfs` graphify uses. **Whole-tree analysis: 8.5s**, independent of
+dependency count.
+
+`query_graph` has no JSON mode — the global `--json` flag wraps its *text* table
+in an MCP envelope rather than structuring it — so its rows are parsed with
+`shlex` against the declared column header. C++ makes this necessary: qualified
+names like `operator std::string` contain spaces and come back quoted.
+
+Two smaller findings: `trace_path` refuses a bare name (`compress` returns
+`status: ambiguous` with both candidates) so seeds must be qualified, which the
+enclosing-function lookup supplies for free; and graphify's own 21 MB
+`graphify-out/` is itself indexed by codebase-memory when both are used on the
+same checkout, putting `GRAPH_REPORT.md` sections into appv2's graph.
+
 ## Graph backends measured for the first time — 2026-08-14
 
 Roadmap §4.1 said "no graph has ever been generated for either project". That is
@@ -1144,6 +1268,10 @@ The rules, in order:
    C, C++ and Python — our two first-class targets plus one — grades every edge
    it returns, refuses ambiguous matches instead of guessing, produced 3.5× the
    nodes in two-thirds the time on appv2, and leaves the checkout untouched.
+   **Superseded 2026-08-15:** measured against graphify on the same tree it
+   locates fewer sites on four dependencies of five, so prefer it for *radius*
+   and edge quality, not for coverage — and run both where coverage matters. See
+   [Both backends compared](#both-backends-compared-on-the-same-tree--2026-08-15).
 3. **Use graphify when a native binary is unacceptable or unavailable** — a
    locked-down machine, an air-gapped build, an unsupported platform. It is pure
    Python, installs via uv, and emits a portable `graph.json` that deptool reads

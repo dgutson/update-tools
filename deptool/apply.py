@@ -99,10 +99,37 @@ def plan(root: str, dep: Dep, new_version: str, companions: list[dict] | None = 
 
     old_version = dep.version
     if not old_version:
+        # `find_package(CURL)` really is asking the machine for whatever it has,
+        # so pointing at the OS is the right advice. A `pypi` or `npm` record
+        # with no version is a dependency someone declared without a
+        # constraint, and sending its owner to the package manager would be a
+        # confidently wrong answer to a different question.
+        system = dep.kind.startswith("cmake-") or dep.kind == "pkg-config"
         raise ApplyError(
             f"{dep.name}: not pinned to a version in this repo "
-            f"(kind={dep.kind}) — nothing to edit. This is a system dependency; "
-            f"update it through the OS package manager or CI image instead."
+            f"(kind={dep.kind}) — nothing to edit. "
+            + (
+                "This is a system dependency; update it through the OS package "
+                "manager or CI image instead."
+                if system
+                else "It is declared with no version constraint, so there is no "
+                "pin to move; add one first if you want it managed here."
+            )
+        )
+
+    # A constraint is not a pin. A ranged requirement reaches here with its
+    # remaining operators still attached — `httpx>=0.27,<1` arrives as
+    # `0.27,<1` — and swapping that for a bare version rewrites the whole
+    # requirement, silently dropping the upper bound. That is a wrong answer
+    # stated confidently, which is worse than the missing one it replaces.
+    # Carrying ranges through as ranges is its own item; refusing is what this
+    # can honestly do until then.
+    if re.search(r"[,<>=!~\s]", old_version):
+        raise ApplyError(
+            f"{dep.name}: {dep.raw_pin or old_version} is a range, not a pin — "
+            f"bumping it would rewrite the whole constraint and drop its other "
+            f"bounds. Edit {dep.declared_in} by hand and decide what the range "
+            f"should become."
         )
 
     text = open(full, encoding="utf-8", errors="replace").read()

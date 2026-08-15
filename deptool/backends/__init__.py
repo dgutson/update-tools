@@ -6,10 +6,13 @@ dependency sits below main(), whether a call is reachable from a real-time
 thread, which of our functions transitively depend on it.
 
 Every available backend runs; they are complementary, not ranked alternatives.
-Graphify resolves the C ABI but cannot see namespaced C++; codebase-memory
-claims LSP-grade type resolution. Stopping at the first backend that returned
-anything would let a partial result mask a dependency another could have
-covered.
+Both parse C and C++ properly — graphify carries a C++ tree-sitter config with
+`qualified_identifier` in its call accessors, so the long-standing claim here
+that it "cannot see namespaced C++" was written from assumption and is false.
+What codebase-memory adds is type resolution: it binds parameters and infers
+return types, and it grades every edge it returns. Stopping at the first backend
+that returned anything would let a partial result mask a dependency another
+could have covered.
 
 Detection is automatic and non-fatal: a missing backend is never an error.
 """
@@ -20,8 +23,10 @@ import bisect
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import sys
 
 from ..model import Dep
 from . import builtin
@@ -326,10 +331,25 @@ def _reverse_bfs(seeds: set[str], callers: dict[str, set[str]]) -> tuple[set, se
     return direct, reached
 
 
-# Whether the codebase-memory enricher may contribute. Off until its seeding and
-# its invocation are fixed together — see `_enrich_codebase_memory`. Detection is
-# unaffected: `detect` still reports the backend as present.
-CODEBASE_MEMORY_ENABLED = False
+# Whether the codebase-memory enricher may contribute. Its invocation, its
+# seeding and its response parsing were all wrong and were fixed together; see
+# `_enrich_codebase_memory`.
+CODEBASE_MEMORY_ENABLED = True
+
+# Rows per `search_graph` page. The node table is pulled in as few calls as
+# possible because the cost here is per *invocation*, not per row: each one pays
+# a daemon start-up, measured at ~3.7s cold and ~1.25s warm, while a single call
+# returned all 3712 methods of a 1234-file C++ project in 1.3s. That is why this
+# backend reads the graph in bulk and walks it in memory rather than asking
+# `trace_path` one question per call site.
+CBMEM_PAGE = 5000
+CBMEM_INDEX_TIMEOUT = 300
+CBMEM_QUERY_TIMEOUT = 180
+
+# Node labels that can enclose a call site. Same rule as `_defs_by_file`:
+# `blast_radius` counts functions, so a Class or File node would "contain" the
+# line without being able to call anything.
+CBMEM_CALLABLE = ("Function", "Method")
 
 
 def _codebase_memory_exe() -> str | None:
@@ -340,29 +360,210 @@ def _codebase_memory_exe() -> str | None:
     return None
 
 
+def _cbmem_run(exe: str, root: str, tool: str, args: list[str],
+               timeout: int) -> str | None:
+    """One codebase-memory CLI call. Returns stdout, or None if it failed.
+
+    The return code is checked. It was previously discarded, which is what let a
+    rejected flag pass for a successful index.
+
+    Progress and allocator logging go to stderr, so stdout is the payload alone.
+    """
+    try:
+        out = subprocess.run(
+            [exe, "cli", tool, *args],
+            cwd=root, capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout
+
+
+def _cbmem_index(exe: str, root: str) -> str | None:
+    """Index the tree; return the project name it was stored under, or None.
+
+    The name is read back out of the response rather than assumed. `--name` is
+    documented to encode non-ASCII bytes and normalise unsafe path characters,
+    so the name we ask for is not always the name `--project` will need.
+    """
+    asked = os.path.basename(os.path.abspath(root))
+    raw = _cbmem_run(exe, root, "index_repository",
+                     ["--repo-path", root, "--name", asked], CBMEM_INDEX_TIMEOUT)
+    if raw is None:
+        # Standing rule 4: a failed index must not read as an absent backend.
+        # Silently swallowing this is precisely why the enricher appeared to
+        # work while contributing nothing.
+        print(
+            "codebase-memory: indexing failed, so blast radius is unmeasured "
+            f"(tried: {exe} cli index_repository --repo-path {root})",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        return str(json.loads(raw).get("project") or asked)
+    except ValueError:
+        return asked
+
+
+def _cbmem_rows(table: dict) -> list[tuple[str, str, dict]]:
+    """(qualified_name, file, column->value) per row of a tree-format response.
+
+    `search_graph` and `trace_path` share one envelope::
+
+        {"cols": [...],
+         "groups": [{"qn_prefix": ..., "file": ..., "rows": [[...], ...]}]}
+
+    Row values are positional; their names live in `cols`, and the qualified name
+    is `qn_prefix` joined to the row's `name`. A row only means anything read
+    against that header.
+
+    Reading it by column is the whole point. The previous version walked the
+    response blindly for any `name`/`function_name`/`symbol`/`label` key and
+    harvested the table's own column headers as though they were symbols — it
+    reported `zlib: 3 function(s) reach it — Function, Method, compress`, of
+    which two are the words at the top of a column and the third is our own
+    `ZStream::compress`.
+    """
+    cols = [str(c) for c in (table.get("cols") or [])]
+    if "name" not in cols:
+        return []
+    out: list[tuple[str, str, dict]] = []
+    for group in table.get("groups") or []:
+        if not isinstance(group, dict):
+            continue
+        prefix = str(group.get("qn_prefix") or "")
+        path = str(group.get("file") or "")
+        for row in group.get("rows") or []:
+            if not isinstance(row, list) or len(row) != len(cols):
+                continue  # not the declared shape; refuse to guess at it
+            values = dict(zip(cols, row))
+            name = str(values.get("name") or "")
+            if not name:
+                continue
+            out.append((f"{prefix}.{name}" if prefix else name, path, values))
+    return out
+
+
+def _cbmem_defs(exe: str, root: str, project: str) -> dict[str, list[tuple[int, int, str]]]:
+    """path -> [(start, end, qualified_name)] for every callable in the graph.
+
+    Unlike graphify, codebase-memory reports an explicit end line (`lines` is
+    `"72-147"`), so enclosure is a real containment test rather than "the nearest
+    declaration above". A site in a gap between two functions is therefore
+    correctly reported as unlocated instead of being attributed to the one above
+    it.
+    """
+    defs: dict[str, list[tuple[int, int, str]]] = {}
+    for label in CBMEM_CALLABLE:
+        offset = 0
+        while True:
+            raw = _cbmem_run(
+                exe, root, "search_graph",
+                ["--project", project, "--label", label, "--format", "json",
+                 "--limit", str(CBMEM_PAGE), "--offset", str(offset)],
+                CBMEM_QUERY_TIMEOUT,
+            )
+            if raw is None:
+                break
+            try:
+                page = json.loads(raw)
+            except ValueError:
+                break
+            for qn, path, values in _cbmem_rows(page):
+                span = str(values.get("lines") or "")
+                m = re.fullmatch(r"(\d+)-(\d+)", span)
+                if not (m and path):
+                    continue
+                defs.setdefault(os.path.normpath(path), []).append(
+                    (int(m.group(1)), int(m.group(2)), qn)
+                )
+            if not page.get("has_more"):
+                break
+            offset += CBMEM_PAGE
+    for entries in defs.values():
+        entries.sort()
+    return defs
+
+
+def _cbmem_calls(exe: str, root: str, project: str) -> tuple[dict[str, set[str]], dict[tuple[str, str], str]]:
+    """Reverse call adjacency, plus how each edge was resolved.
+
+    One `query_graph` call returns the whole CALLS relation — 10046 edges in 2.9s
+    on a 1234-file C++ project — which is cheaper than one `trace_path` per seed
+    and gives the same answer, since both walk the same edges.
+
+    `query_graph` has no JSON mode: it answers with a header naming its columns,
+    then one indented row per result, quoting any field containing a space (C++
+    yields plenty, e.g. `operator std::string`). Rows are parsed with `shlex` and
+    checked against the header's column count; a row that does not match the
+    declared shape is dropped rather than guessed at.
+    """
+    raw = _cbmem_run(
+        exe, root, "query_graph",
+        ["--project", project, "--query",
+         "MATCH (a)-[r:CALLS]->(b) RETURN a.qualified_name AS src, "
+         "b.qualified_name AS dst, r.strategy AS strat"],
+        CBMEM_QUERY_TIMEOUT,
+    )
+    callers: dict[str, set[str]] = {}
+    how: dict[tuple[str, str], str] = {}
+    if raw is None:
+        return callers, how
+
+    header = re.search(r"^rows:\s*\d+\s*\(cols:\s*([^)]*)\)", raw, re.M)
+    if not header:
+        return callers, how
+    cols = header.group(1).split()
+    for line in raw.splitlines():
+        if not line.startswith("  ") or line.startswith("total:"):
+            continue
+        try:
+            fields = shlex.split(line)
+        except ValueError:
+            continue
+        if len(fields) != len(cols):
+            continue
+        row = dict(zip(cols, fields))
+        src, dst = row.get("src"), row.get("dst")
+        if not (src and dst):
+            continue
+        callers.setdefault(dst, set()).add(src)
+        how[(src, dst)] = row.get("strat") or ""
+    return callers, how
+
+
+def _enclosing_cbmem(defs: dict[str, list[tuple[int, int, str]]],
+                     path: str, line: int) -> str | None:
+    """The innermost callable whose line range contains `line` in `path`."""
+    best: tuple[int, str] | None = None
+    for start, end, qn in defs.get(os.path.normpath(path), []):
+        if start <= line <= end and (best is None or start >= best[0]):
+            best = (start, qn)
+    return best[1] if best else None
+
+
 def _enrich_codebase_memory(root: str, deps: list[Dep]) -> bool:
-    """Count inbound callers of each consumed symbol via codebase-memory-mcp.
+    """Measure blast radius from a codebase-memory index.
 
-    Its CLI has no `callers` verb; the documented shape is
-    `cli trace_path --project P --function-name F --direction inbound --json`,
-    against a project that has been indexed first.
+    **Seeded from call sites, not from symbol names** — the same correction
+    `_enrich_graphify` carries, for the same reason. codebase-memory indexes only
+    the repository's own code, so a dependency's own functions are never nodes:
+    `curl_easy_setopt`, `deflate`, `BIO_free`, `archive_entry_new` and
+    `iconv_open` each returned `function not found` against a real 1234-file
+    project, and `search_graph` for their patterns returned zero rows, against a
+    control query that returned rows normally. Seeding by symbol name therefore
+    cannot match the dependency's symbol — only one of our own homonyms.
 
-    HELD OFF pending the invocation fix. Run against a real install, this path
-    seeds the same way `_enrich_graphify` used to — by looking a dependency's
-    symbol names up in the graph — and codebase-memory indexes *only* the
-    repository's own code. Every external symbol queried against a real 1234-file
-    project (`curl_easy_setopt`, `deflate`, `BIO_free`, `archive_entry_new`,
-    `iconv_open`) returned `function not found`, and `search_graph` for their
-    patterns returned zero rows, so there is no case in which a symbol-name match
-    here is the dependency's symbol rather than one of our own homonyms. It
-    reported `zlib: 3 function(s) reach it — Function, Method, compress`: our own
-    `ZStream::compress`, plus two column headers `_collect_names` scraped out of
-    the tool's table output. Because `_record` keeps the largest count, that
-    overrode graphify's correct answer.
+    The seed is instead the function *containing* a site the builtin extractor
+    already located, which is a fact we read rather than infer. Verified against
+    the case in HISTORY: `archive/z_stream.cpp:109` resolves to
+    `ZStream::compress` (lines 72-147) and its inbound trace returns exactly one
+    caller, `postprocess`.
 
-    Re-enable it with a site-based seed once the invocation is fixed — the flags
-    below are also wrong (`--repo-path`/`--name`, not `--path`/`--project`) and
-    the return code is discarded, so a failed index is silent.
+    Every node here is our own code by construction, so unlike the graphify path
+    there is no external-stub category to exclude.
     """
     if not CODEBASE_MEMORY_ENABLED:
         return False
@@ -371,42 +572,79 @@ def _enrich_codebase_memory(root: str, deps: list[Dep]) -> bool:
     if not exe:
         return False
 
-    project = os.path.basename(os.path.abspath(root))
-    try:
-        subprocess.run(
-            [exe, "cli", "index_repository", "--path", root, "--project", project],
-            cwd=root, capture_output=True, text=True, timeout=300,
-        )
-    except (OSError, subprocess.SubprocessError):
+    project = _cbmem_index(exe, root)
+    if not project:
         return False
+
+    defs = _cbmem_defs(exe, root, project)
+    if not defs:
+        return False
+    callers, how = _cbmem_calls(exe, root, project)
 
     touched = False
     for dep in deps:
-        callers: set[str] = set()
-        for sym in dep.consumed[:8]:
-            bare = sym.split("::")[-1].split(".")[-1]
-            try:
-                out = subprocess.run(
-                    [exe, "cli", "trace_path", "--project", project,
-                     "--function-name", bare, "--direction", "inbound", "--json"],
-                    cwd=root, capture_output=True, text=True, timeout=30,
+        seeds: set[str] = set()
+        located = unlocated = 0
+        calls_directly = False
+        for site in dep.sites:
+            if site.context == "include":
+                continue  # an #include is a file fact, not a function's use
+            qn = _enclosing_cbmem(defs, site.path, site.line)
+            if qn:
+                seeds.add(qn)
+                located += 1
+                calls_directly = calls_directly or site.context == "call"
+            else:
+                unlocated += 1
+        if not seeds:
+            if unlocated:
+                # Standing rule 4. Saying nothing here is what makes an
+                # unmeasured dependency read like an unaffected one: openssl has
+                # 14 sites on the development case and located none of them,
+                # because its members are declared inside a class the index
+                # recorded without method nodes. `blast_radius` stays unset —
+                # criterion 6 — but the reason is now on the page.
+                dep.notes.append(
+                    f"codebase-memory: none of {unlocated} site(s) fall inside a "
+                    f"function the index knows, so blast radius is unmeasured "
+                    f"here, not zero"
                 )
-            except (OSError, subprocess.SubprocessError):
-                return touched
-            if out.returncode != 0 or not out.stdout.strip():
-                continue
-            try:
-                data = json.loads(out.stdout)
-            except ValueError:
-                continue
-            callers |= _collect_names(data)
-        if callers:
-            _record(
-                dep, "codebase-memory", len(callers),
-                f"codebase-memory: {len(callers)} function(s) reach it — "
-                + ", ".join(sorted(callers)[:6]),
+            continue
+
+        direct, reached = _reverse_bfs(seeds, callers)
+        our_reachers = seeds | reached
+
+        names = sorted(qn.split(".")[-1] for qn in sorted(seeds)[:6])
+        note = (
+            f"codebase-memory: {len(our_reachers)} function(s) reach it, seeded "
+            f"from {located} of {located + unlocated} located site(s)"
+        )
+        example = ", ".join(n for n in names if n)
+        if example:
+            note += f" — e.g. {example}"
+        if unlocated:
+            # Standing rule 4: a partial read has to say so.
+            note += (
+                f"; {unlocated} site(s) not located in the graph, so this is a "
+                f"lower bound"
             )
-            touched = True
+        # codebase-memory grades its own edges, which is the thing it offers that
+        # graphify does not. An edge resolved by matching a name is a weaker
+        # claim than one resolved from a type, so say when the answer rests on
+        # them rather than presenting one number for both.
+        # Counted over edges, not callers: one caller reaching two seeds is two
+        # edges, so measuring the numerator in pairs and the denominator in
+        # callers produced "19 of 17".
+        graded = [(s, t) for s in direct for t in seeds if (s, t) in how]
+        guessed = sum(1 for e in graded if not how[e].startswith("lsp"))
+        if guessed:
+            note += (
+                f"; {guessed} of {len(graded)} direct edge(s) resolved by name "
+                f"rather than by type"
+            )
+        _record(dep, "codebase-memory", len(our_reachers), note,
+                1 if calls_directly else None)
+        touched = True
     return touched
 
 
@@ -420,20 +658,3 @@ _ENRICHERS = {
 # What `--backend` accepts. Since that flag now *restricts* the run rather than
 # merely reordering it, a typo would silently disable every rich backend.
 NAMES = sorted(_ENRICHERS) + ["builtin"]
-
-
-def _collect_names(data) -> set[str]:
-    """Pull symbol names out of a trace_path result of unknown exact shape."""
-    names: set[str] = set()
-    stack = [data]
-    while stack:
-        cur = stack.pop()
-        if isinstance(cur, dict):
-            for key in ("name", "function_name", "symbol", "label"):
-                val = cur.get(key)
-                if isinstance(val, str) and val:
-                    names.add(val)
-            stack.extend(cur.values())
-        elif isinstance(cur, list):
-            stack.extend(cur)
-    return names

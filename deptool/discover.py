@@ -209,33 +209,158 @@ def _cargo(root: str, rel: str) -> list[Dep]:
 
 _PY_REQ = re.compile(r"^\s*([A-Za-z0-9._\-]+)\s*(?:\[[^\]]+\])?\s*([=<>!~]=?[^;#]*)?")
 
+# A table header, and a key whose value follows. The key may be dotted and
+# either half may be quoted, which is how a group name that is not a bare word
+# is written.
+_TOML_HEADER = re.compile(r"^\s*\[\[?\s*([^\[\]]+?)\s*\]\]?\s*(?:#.*)?$")
+_TOML_SEG = r"(?:[A-Za-z0-9_\-]+|\"[^\"]*\"|'[^']*')"
+_TOML_KEY = re.compile(rf"^\s*({_TOML_SEG}(?:\s*\.\s*{_TOML_SEG})*)\s*=\s*")
+
+
+def _toml_split_key(raw: str) -> list[str]:
+    """A dotted key as its segments. A quoted key is one segment, dots and all."""
+    if '"' in raw or "'" in raw:
+        return [raw.strip().strip("\"'")]
+    return [p.strip() for p in raw.split(".")]
+
+
+def _toml_line_strings(line: str) -> tuple[list[str], int]:
+    """The strings on one line, and its net bracket depth.
+
+    Both in one pass, because a `[` inside a string is not an array and a `#`
+    inside one does not start a comment.
+    """
+    out: list[str] = []
+    depth = 0
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if c == "#":
+            break
+        if c in "\"'":
+            j, buf = i + 1, []
+            while j < len(line) and line[j] != c:
+                if c == '"' and line[j] == "\\" and j + 1 < len(line):
+                    buf.append(line[j + 1])
+                    j += 2
+                    continue
+                buf.append(line[j])
+                j += 1
+            if j >= len(line):
+                break  # unterminated — a multi-line string; read no further
+            out.append("".join(buf))
+            i = j + 1
+            continue
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+        i += 1
+    return out, depth
+
+
+def _toml_array_strings(text: str) -> dict[tuple[str, str], list[tuple[int, str]]]:
+    """(table, key) -> every string in that array value, with its line.
+
+    `tomllib` hands back the values and discards the positions, and here that
+    is not a cosmetic loss: a declaration with no line is one `apply` is not
+    allowed to edit, so *every* dependency declared in a `pyproject.toml` was
+    report-only however precisely it was pinned.
+
+    A scan rather than a second TOML parser, because only one shape is wanted
+    — a key, a `[`, then quoted strings until the bracket closes — and a
+    parser that is nearly right about the rest is a liability. What it cannot
+    follow it leaves out rather than guessing at, and the caller checks every
+    line it is given against what `tomllib` parsed.
+    """
+    out: dict[tuple[str, str], list[tuple[int, str]]] = {}
+    table = ""
+    key: tuple[str, str] | None = None
+    depth = 0
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        if key is None:
+            head = _TOML_HEADER.match(raw)
+            if head:
+                table = ".".join(_toml_split_key(head.group(1)))
+                continue
+            km = _TOML_KEY.match(raw)
+            if not km:
+                continue
+            rest = raw[km.end():]
+            if not rest.lstrip().startswith("["):
+                continue
+            segs = _toml_split_key(km.group(1))
+            key = (".".join([table] + segs[:-1]).strip("."), segs[-1])
+            out.setdefault(key, [])
+            strings, delta = _toml_line_strings(rest)
+        else:
+            strings, delta = _toml_line_strings(raw)
+        out[key].extend((lineno, s) for s in strings)
+        depth += delta
+        if depth <= 0:
+            depth, key = 0, None
+    return out
+
+
+def _spec_line(found: list[tuple[int, str]], index: int, spec: str) -> int:
+    """The line `spec` sits on, or 0 when the scan cannot vouch for one.
+
+    Position by index, then *check* the scanned text against what `tomllib`
+    parsed: agreeing on the count is not the same as agreeing on the string,
+    and a line holding a different requirement is worse than no line at all —
+    `apply` would edit whichever dependency happened to share the version. A
+    single unambiguous match by value is accepted as a fallback; anything else
+    stays 0, which leaves the declaration report-only, which is where it was.
+    """
+    if index < len(found) and found[index][1] == spec:
+        return found[index][0]
+    hits = [ln for ln, val in found if val == spec]
+    return hits[0] if len(hits) == 1 else 0
+
 
 def _pyproject(root: str, rel: str) -> list[Dep]:
     try:
-        data = tomllib.load(open(os.path.join(root, rel), "rb"))
+        text = open(os.path.join(root, rel), encoding="utf-8", errors="replace").read()
+        data = tomllib.loads(text)
     except (OSError, ValueError):
         return []
-    deps: list[Dep] = []
-    entries = [(s, "runtime", "project.dependencies")
-               for s in (data.get("project", {}).get("dependencies") or [])]
-    for group, specs in (data.get("project", {}).get("optional-dependencies") or {}).items():
+    located = _toml_array_strings(text)
+    project = data.get("project") or {}
+    # (table, key) -> the requirements under it and what they are for. The key
+    # doubles as the lookup into the scan and as the name of the site.
+    arrays = [(("project", "dependencies"), "runtime", project.get("dependencies") or [])]
+    for group, specs in (project.get("optional-dependencies") or {}).items():
         scope = "test" if re.search(r"test|dev|lint", group, re.I) else "runtime"
-        entries += [(s, scope, f"project.optional-dependencies.{group}") for s in specs]
-    for spec, scope, where in entries:
-        m = _PY_REQ.match(spec)
-        if not m:
-            continue
-        deps.append(
-            Dep(
-                name=m.group(1),
-                kind="pypi",
-                version=(m.group(2) or "").strip().lstrip("=<>!~ "),
-                raw_pin=spec.strip(),
-                declared_in=f"{rel} ({where})",
-                scope=scope,
-                upstream=Upstream(kind="pypi", ref=m.group(1)),
+        arrays.append((("project.optional-dependencies", group), scope, specs or []))
+
+    deps: list[Dep] = []
+    for at, scope, specs in arrays:
+        where = ".".join(at)
+        found = located.get(at) or []
+        for index, spec in enumerate(specs):
+            m = _PY_REQ.match(spec)
+            if not m:
+                continue
+            line = _spec_line(found, index, spec)
+            deps.append(
+                Dep(
+                    name=m.group(1),
+                    kind="pypi",
+                    version=(m.group(2) or "").strip().lstrip("=<>!~ "),
+                    raw_pin=spec.strip(),
+                    declared_in=f"{rel}:{line}" if line else f"{rel} ({where})",
+                    scope=scope,
+                    upstream=Upstream(kind="pypi", ref=m.group(1)),
+                    # Standing rule 4: a declaration whose position could not be
+                    # read is report-only, and has to say so rather than look
+                    # like an ordinary one nobody happened to bump.
+                    notes=[] if line else [
+                        f"declared in {where} but its line could not be located, "
+                        f"so this pin is report-only — `apply` does not edit a "
+                        f"position it had to guess at"
+                    ],
+                )
             )
-        )
     return deps
 
 
