@@ -16,8 +16,10 @@ Detection is automatic and non-fatal: a missing backend is never an error.
 
 from __future__ import annotations
 
+import bisect
 import json
 import os
+import re
 import shutil
 import subprocess
 
@@ -110,21 +112,61 @@ def _graphify_path(root: str) -> str | None:
     return None
 
 
+def _line_of(node: dict) -> int | None:
+    """Start line from graphify's `source_location` ("L40"), or None."""
+    m = re.search(r"\d+", str(node.get("source_location") or ""))
+    return int(m.group()) if m else None
+
+
+def _defs_by_file(nodes: list[dict]) -> dict[str, list[tuple[int, str]]]:
+    """path -> sorted [(start_line, node_id)] for nodes that can enclose a site.
+
+    Only callable nodes qualify. A file or class node would also "contain" the
+    line, but `blast_radius` counts *functions*, so admitting them would inflate
+    it with things that cannot call anything.
+    """
+    out: dict[str, list[tuple[int, str]]] = {}
+    for n in nodes:
+        if not n.get("_callable") or not n.get("id"):
+            continue
+        path = str(n.get("source_file") or "").strip()
+        line = _line_of(n)
+        if not path or line is None:
+            continue
+        out.setdefault(os.path.normpath(path), []).append((line, n["id"]))
+    for entries in out.values():
+        entries.sort()
+    return out
+
+
+def _enclosing(defs: dict[str, list[tuple[int, str]]], path: str, line: int) -> str | None:
+    """The innermost callable whose declaration precedes `line` in `path`."""
+    entries = defs.get(os.path.normpath(path))
+    if not entries:
+        return None
+    i = bisect.bisect_right(entries, (line, "￿")) - 1
+    return entries[i][1] if i >= 0 else None
+
+
 def _enrich_graphify(root: str, deps: list[Dep]) -> bool:
     """Measure blast radius from a graphify graph.json.
 
-    Graphify emits the dependency's own symbols as nodes (`fluid_synth_noteon`
-    is a node, not just a string in our source), and its call edges live under
-    `links` with `relation: "calls"`. There is no synthetic `main` node, so
-    depth-from-entry-point is not available. What *is* available, and is more
-    useful for judging an upgrade, is the reverse question: how much of our
-    code transitively reaches this dependency.
+    **Seeded from call sites, not from symbol names.** Graphify indexes only the
+    repository's own code, so a dependency's functions are almost never nodes:
+    measured against a 1234-file C++ project, 5 of 74 consumed symbols matched a
+    node, and every match was wrong — three were dangling stubs and `compress`
+    resolved to *our own* `ZStream::compress`, which merely shares zlib's name.
+    Matching labels against a dependency's symbols is guessing (standing rule 3),
+    so the seed is instead the function *containing* a site the extractor already
+    located, which is a fact we read rather than infer.
 
-    Symbols consumed through a macro (`HEGEL_TEST(...)`) are nodes with no
-    `calls` edges at all, so a calls-only walk matches the seed and then
-    reports a blast radius of zero — the worst possible answer, since it reads
-    as "nothing uses this". Those deps fall back to `references` edges, which
-    is a weaker claim and is labelled as such in the note.
+    The one label match that is trustworthy is a node with an **empty
+    `source_file`**: graphify knows of the symbol but has no definition for it,
+    which is exactly what an external symbol looks like. A label match on a node
+    that does have a source file is our own code and is rejected.
+
+    `blast_radius` counts only nodes that have a source file — our functions —
+    so an external stub is never counted as part of our own blast radius.
     """
     path = _graphify_path(root)
     if not path:
@@ -140,20 +182,33 @@ def _enrich_graphify(root: str, deps: list[Dep]) -> bool:
     if not isinstance(raw_edges, list):
         raw_edges = graph.get("edges") or []
     edges = [e for e in raw_edges if isinstance(e, dict)]
-    if not nodes or not edges:
+    # Edges are no longer required: a located site makes its enclosing function
+    # a reacher on its own, so a leaf that nothing calls still has a radius of 1.
+    if not nodes:
         return False
 
     by_id = {n.get("id"): n for n in nodes if n.get("id")}
-    # label -> ids. Labels for our own methods look like ".foo()".
-    by_label: dict[str, list[str]] = {}
+    # Nodes graphify has a definition for — our own code. `blast_radius` counts
+    # these and nothing else.
+    ours = {
+        nid for nid, n in by_id.items()
+        if str(n.get("source_file") or "").strip()
+    }
+    # label -> ids, restricted to nodes with *no* source file. Those are symbols
+    # graphify saw referenced but never defined, which is what a dependency's
+    # own symbols look like. Anything with a source file is ours.
+    external: dict[str, list[str]] = {}
     for n in nodes:
+        if n.get("id") in ours:
+            continue
         label = str(n.get("label") or "").strip()
         if not label:
             continue
-        by_label.setdefault(label, []).append(n["id"])
+        external.setdefault(label, []).append(n["id"])
         bare = label.strip(".()")
         if bare and bare != label:
-            by_label.setdefault(bare, []).append(n["id"])
+            external.setdefault(bare, []).append(n["id"])
+    defs = _defs_by_file(nodes)
 
     # Two reverse adjacencies: genuine call edges, and the same plus the much
     # looser `references` relation used only as a fallback.
@@ -172,31 +227,60 @@ def _enrich_graphify(root: str, deps: list[Dep]) -> bool:
 
     touched = False
     for dep in deps:
-        seeds: set[str] = set()
+        # Primary seed: the function containing each site we already located.
+        site_seeds: set[str] = set()
+        located = unlocated = 0
+        calls_directly = False
+        for site in dep.sites:
+            if site.context == "include":
+                continue  # an #include is a file fact, not a function's use
+            nid = _enclosing(defs, site.path, site.line)
+            if nid:
+                site_seeds.add(nid)
+                located += 1
+                calls_directly = calls_directly or site.context == "call"
+            else:
+                unlocated += 1
+
+        # Secondary seed: the dependency's own symbols, when graphify emitted
+        # them as definition-less stubs.
+        ext_seeds: set[str] = set()
         for sym in dep.consumed:
             bare = sym.split("::")[-1].split(".")[-1]
             for cand in (sym, bare):
-                for nid in by_label.get(cand, []):
-                    seeds.add(nid)
+                ext_seeds.update(external.get(cand, []))
+
+        seeds = site_seeds | ext_seeds
         if not seeds:
             continue
 
         direct, reached = _reverse_bfs(seeds, callers)
         via_references = False
-        if not direct:
-            # Macro or header-only use: the seed exists but nothing "calls" it.
+        if not direct and not site_seeds:
+            # An external stub nothing "calls" — macro or header-only use.
             direct, reached = _reverse_bfs(seeds, loose)
             via_references = bool(direct)
 
-        our_reachers = {n for n in reached if n in by_id and n not in seeds}
-        if not our_reachers and not direct:
+        # Only our own functions count, and a seed we located is itself one of
+        # them: it uses the dependency directly.
+        our_reachers = (seeds | reached) & ours
+        if not our_reachers:
             continue
 
         names = sorted(
-            str(by_id[n].get("label", "")).strip(".()") for n in list(direct)[:6] if n in by_id
+            str(by_id[n].get("label", "")).strip(".()")
+            for n in sorted(site_seeds or direct)[:6] if n in by_id
         )
         example = ", ".join(n for n in names if n)
-        if via_references:
+        if located:
+            note = (
+                f"graphify: {len(our_reachers)} function(s) reach it, seeded from "
+                f"{located} of {located + unlocated} located site(s)"
+            )
+            # The extractor already knows whether the site was a call; inferring
+            # it from edges would be a weaker claim about the same fact.
+            depth = 1 if calls_directly else None
+        elif via_references:
             # No call edge was ever traversed, so claiming a call depth of 1
             # would be a fabrication — leave it unset.
             note = (
@@ -213,6 +297,12 @@ def _enrich_graphify(root: str, deps: list[Dep]) -> bool:
             depth = 1
         if example:
             note += f" — e.g. {example}"
+        if unlocated:
+            # Standing rule 4: a partial read has to say so.
+            note += (
+                f"; {unlocated} site(s) not located in the graph, so this is a "
+                f"lower bound"
+            )
         _record(dep, "graphify", len(our_reachers), note, depth)
         touched = True
     return touched
@@ -236,6 +326,12 @@ def _reverse_bfs(seeds: set[str], callers: dict[str, set[str]]) -> tuple[set, se
     return direct, reached
 
 
+# Whether the codebase-memory enricher may contribute. Off until its seeding and
+# its invocation are fixed together — see `_enrich_codebase_memory`. Detection is
+# unaffected: `detect` still reports the backend as present.
+CODEBASE_MEMORY_ENABLED = False
+
+
 def _codebase_memory_exe() -> str | None:
     for name in ("codebase-memory-mcp", "codebase-memory", "cbmem"):
         found = shutil.which(name)
@@ -251,9 +347,26 @@ def _enrich_codebase_memory(root: str, deps: list[Dep]) -> bool:
     `cli trace_path --project P --function-name F --direction inbound --json`,
     against a project that has been indexed first.
 
-    NOTE: written against published documentation and exercised only through
-    the unit tests' fakes — this path has not been run against a real install.
+    HELD OFF pending the invocation fix. Run against a real install, this path
+    seeds the same way `_enrich_graphify` used to — by looking a dependency's
+    symbol names up in the graph — and codebase-memory indexes *only* the
+    repository's own code. Every external symbol queried against a real 1234-file
+    project (`curl_easy_setopt`, `deflate`, `BIO_free`, `archive_entry_new`,
+    `iconv_open`) returned `function not found`, and `search_graph` for their
+    patterns returned zero rows, so there is no case in which a symbol-name match
+    here is the dependency's symbol rather than one of our own homonyms. It
+    reported `zlib: 3 function(s) reach it — Function, Method, compress`: our own
+    `ZStream::compress`, plus two column headers `_collect_names` scraped out of
+    the tool's table output. Because `_record` keeps the largest count, that
+    overrode graphify's correct answer.
+
+    Re-enable it with a site-based seed once the invocation is fixed — the flags
+    below are also wrong (`--repo-path`/`--name`, not `--path`/`--project`) and
+    the return code is discarded, so a failed index is silent.
     """
+    if not CODEBASE_MEMORY_ENABLED:
+        return False
+
     exe = _codebase_memory_exe()
     if not exe:
         return False

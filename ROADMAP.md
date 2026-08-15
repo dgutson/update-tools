@@ -42,29 +42,6 @@ breaking it produced a wrong answer.
 
 ## Now
 
-### R-001 — Re-seed blast radius from the enclosing function
-
-- **Category:** Graph backends
-- **What:** Replace the label-matching seed in `_enrich_graphify`
-  (`deptool/backends/__init__.py:174-183`), which looks up a dependency's symbol
-  names in the graph's node labels. Seed instead from the `Site(path, line, symbol,
-  context)` records the builtin extractor already produces: find the graph node whose
-  source span contains that file and line, then reverse-BFS from it. Until this lands,
-  `graphify-out/` must be absent from any tree the tool runs on, or the enricher
-  disabled — a graph is present in this repo and in `endpoint/appv2` right now, and
-  both produce wrong numbers.
-- **Why:** Measured 2026-08-14: neither graphify nor codebase-memory indexes
-  third-party symbols, because both graph only the repository's own code. Of 74
-  `consumed` symbols across `endpoint/appv2`, five matched a graphify node and all
-  five were false — three were dangling stubs with an empty `source_file`, and
-  `compress` resolved to our own `ZStream` method at `archive/z_stream.h:40`. That
-  produced `zlib blast_radius=1, call_depth=1`, a number derived entirely from a name
-  collision. This is standing rule 3 broken by our own code.
-- **Outcome:** `blast_radius` is computed from call sites the tool actually located,
-  or left unset; no reported figure traces back to a symbol-name collision.
-- **Blocked-by:** —
-- **Enables:** R-007, R-014, R-015, R-020
-
 ### R-002 — Fix the codebase-memory invocation and the false backend docstrings
 
 - **Category:** Graph backends
@@ -72,7 +49,11 @@ breaking it produced a wrong answer.
   --project P` to `--repo-path R --name P`, and check the return code instead of
   discarding it. Correct two claims in the module docstring: line 9 ("Graphify
   resolves the C ABI but cannot see namespaced C++") and lines 116-118 ("Graphify
-  emits the dependency's own symbols as nodes").
+  emits the dependency's own symbols as nodes"), and the same claim repeated in the
+  `test_backends_merge_additively` docstring. Then give the enricher a site-based
+  seed as `_enrich_graphify` now has, fix `_collect_names` (it scrapes the table
+  headers `Function` and `Method` out of the tool's output and reports them as
+  function names), and flip `CODEBASE_MEMORY_ENABLED` back on.
 - **Why:** `--project` is rejected outright with `unknown flag`, and because the
   return code is discarded the failure is silent: every subsequent `trace_path` then
   queries an unindexed project, so the enricher returns `False` having contributed
@@ -80,8 +61,9 @@ breaking it produced a wrong answer.
   docstring claims were written from published docs rather than measurement and are
   contradicted by `extract.py:858` and by the seed measurement in R-001.
 - **Outcome:** `codebase-memory` indexes successfully when installed, a failed index
-  is reported rather than swallowed, and the module docstring describes what the
-  backends actually do.
+  is reported rather than swallowed, the module docstring describes what the backends
+  actually do, and the enricher contributes again — seeded from sites, never from
+  symbol names.
 - **Blocked-by:** —
 - **Enables:** R-014
 
@@ -157,7 +139,7 @@ breaking it produced a wrong answer.
   attempt them against.
 - **Outcome:** `consumed` counts reflect method calls, aliased references and
   macro-mediated uses, and `nlohmann_json` on `endpoint/appv2` reports more than 2.
-- **Blocked-by:** R-001
+- **Blocked-by:** —
 - **Enables:** R-020, R-023
 
 ### R-008 — Decide and implement the backend install check
@@ -269,7 +251,7 @@ breaking it produced a wrong answer.
   number.
 - **Outcome:** Two backends run together against one tree and the merged
   `blast_radius` is defensible against both sources of evidence.
-- **Blocked-by:** R-001, R-002
+- **Blocked-by:** R-002
 - **Enables:** —
 
 ### R-015 — Evaluate the graph backends against zeta-daw
@@ -284,7 +266,7 @@ breaking it produced a wrong answer.
   **Locate or re-clone the tree first.**
 - **Outcome:** The backend criteria in HISTORY are confirmed or corrected against a
   second real C++ project.
-- **Blocked-by:** R-001
+- **Blocked-by:** —
 - **Enables:** —
 
 ### R-016 — Ship the Python API-surface diff
@@ -351,7 +333,7 @@ breaking it produced a wrong answer.
 - **Why:** "Three overloads changed" is not actionable; "this call at `foo.cpp:112`
   no longer compiles" is. Requires type information only a graph backend can supply.
 - **Outcome:** A breaking signature change names the call sites that break.
-- **Blocked-by:** R-001, R-007
+- **Blocked-by:** R-007
 - **Enables:** —
 
 ### R-021 — Support several products in one repository

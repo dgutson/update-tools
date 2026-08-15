@@ -30,6 +30,24 @@ Newest first. Retired from ROADMAP.md; the ID is never reused.
 
 ### 2026-08-14
 
+- **R-001** Re-seed blast radius from the enclosing function — `_enrich_graphify` now
+  seeds from the callable containing each located `Site`, and accepts a label match
+  only on a node with an empty `source_file` (a symbol graphify referenced but never
+  defined, which is what an external symbol looks like). `blast_radius` counts only
+  nodes that have a source file, and unlocated sites are reported as a lower bound.
+  On `endpoint/appv2`: libcurl 7 → 31, libarchive 3 → 7, openssl 2 → 6, and zlib's
+  1 now comes from `kaitai::kstream::process_zlib` instead of our own
+  `ZStream::compress`. **Wider than planned:** `_enrich_codebase_memory` seeded the
+  same way and was corrupting the merge — it reported `zlib: 3 — Function, Method,
+  compress`, two of which are table headers scraped by `_collect_names`, and
+  `_record`'s largest-wins rule let that override graphify's correct answer. Since
+  codebase-memory indexes no external symbols at all, *every* symbol-name match it
+  can make is one of our own homonyms, so that path is held off behind
+  `CODEBASE_MEMORY_ENABLED = False` until R-002. Also found: graphify emits no
+  callable nodes for out-of-line method definitions — `archive/z_stream.cpp` has only
+  a file node, its methods being attributed to the header — which is why 5 of zlib's
+  8 sites cannot be located, and a concrete reason to prefer codebase-memory once it
+  works.
 - **Pre-roadmap** — Graph backends generated and run for the first time against
   `endpoint/appv2` and this repo; `codebase-memory-mcp` 0.10.4 installed. Outcome
   diverged sharply from the plan: the intent was to start using `blast_radius`, and

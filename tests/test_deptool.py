@@ -435,13 +435,13 @@ def test_graphify_backend_absent_is_not_an_error(tmp_path):
     assert _enrich_graphify(str(tmp_path), [Dep(name="x", kind="npm")]) is False
 
 
-def test_graphify_falls_back_to_references_for_macro_use(tmp_path):
-    """A macro-consumed symbol has no `calls` edges at all.
+def test_graphify_seeds_macro_use_from_the_enclosing_function(tmp_path):
+    """A macro-consumed symbol is reached through the function that uses it.
 
-    Hegel is used through `HEGEL_TEST(...)`, which graphify emits as a node per
-    test file with no outgoing call edge. A calls-only walk matches the seed
-    and then reports a blast radius of zero, which reads as "nothing uses
-    this" — the exact opposite of the truth.
+    Hegel is used through `HEGEL_TEST(...)`. Graphify emits that as a node in
+    *our* file, so it is indistinguishable by label from our own code — but the
+    extractor already recorded the site, and the function containing it is a
+    fact rather than a name match.
     """
     import json
 
@@ -449,27 +449,93 @@ def test_graphify_falls_back_to_references_for_macro_use(tmp_path):
 
     graph = {
         "nodes": [
-            {"id": "t1", "label": "HEGEL_TEST", "source_file": "test_a.cpp"},
-            {"id": "suite", "label": ".suite()", "source_file": "test_a.cpp"},
-            {"id": "main", "label": ".main()", "source_file": "test_a.cpp"},
+            {"id": "suite", "label": ".suite()", "source_file": "test_a.cpp",
+             "source_location": "L10", "_callable": True},
+            {"id": "main", "label": ".main()", "source_file": "test_a.cpp",
+             "source_location": "L40", "_callable": True},
         ],
-        "links": [
-            # No `calls` edge anywhere near the macro.
-            {"source": "suite", "target": "t1", "relation": "references"},
-            {"source": "main", "target": "suite", "relation": "calls"},
-        ],
+        "links": [{"source": "main", "target": "suite", "relation": "calls"}],
     }
     out = tmp_path / "graphify-out"
     out.mkdir()
     (out / "graph.json").write_text(json.dumps(graph))
 
-    dep = Dep(name="hegel", kind="cmake-fetchcontent-url", consumed=["HEGEL_TEST"])
+    dep = Dep(
+        name="hegel",
+        kind="cmake-fetchcontent-url",
+        consumed=["HEGEL_TEST"],
+        sites=[Site(path="test_a.cpp", line=12, symbol="HEGEL_TEST", context="type")],
+    )
     assert _enrich_graphify(str(tmp_path), [dep]) is True
-    # suite references it; main reaches it transitively through suite.
+    # suite contains the macro use; main reaches it transitively.
     assert dep.blast_radius == 2
-    # Nothing *called* it, so claiming a call depth would be a fabrication.
+    # The site was not a call, so claiming a call depth would be a fabrication.
     assert dep.call_depth is None
-    assert any("no call edges" in n for n in dep.notes)
+
+
+def test_graphify_rejects_a_label_match_on_our_own_function(tmp_path):
+    """Observed on a real project: our `ZStream::compress` is not zlib's.
+
+    Seeding by label matched our own method and reported `blast_radius=1` for
+    zlib — a number derived entirely from a name collision. A node with a
+    source file is our code, whatever it is called.
+    """
+    import json
+
+    from deptool.backends import _enrich_graphify
+
+    graph = {
+        "nodes": [
+            {"id": "ours", "label": "compress", "source_file": "archive/z_stream.h",
+             "source_location": "L40", "_callable": True},
+            {"id": "post", "label": ".postprocess()", "source_file": "archive/tar.cpp",
+             "source_location": "L5", "_callable": True},
+        ],
+        "links": [{"source": "post", "target": "ours", "relation": "calls"}],
+    }
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    (out / "graph.json").write_text(json.dumps(graph))
+
+    # zlib's `compress`, with no site located anywhere.
+    dep = Dep(name="zlib", kind="conan", consumed=["compress", "deflate"])
+    assert _enrich_graphify(str(tmp_path), [dep]) is False
+    assert dep.blast_radius is None
+    assert dep.call_depth is None
+
+
+def test_graphify_reports_unlocated_sites_as_a_lower_bound(tmp_path):
+    """Standing rule 4: a partial read has to say it was partial."""
+    import json
+
+    from deptool.backends import _enrich_graphify
+
+    graph = {
+        "nodes": [
+            {"id": "f", "label": ".use()", "source_file": "a.cpp",
+             "source_location": "L10", "_callable": True},
+        ],
+        "links": [],
+    }
+    out = tmp_path / "graphify-out"
+    out.mkdir()
+    (out / "graph.json").write_text(json.dumps(graph))
+
+    dep = Dep(
+        name="libcurl",
+        kind="conan",
+        consumed=["curl_easy_init"],
+        sites=[
+            Site(path="a.cpp", line=12, symbol="curl_easy_init", context="call"),
+            # A file graphify never indexed.
+            Site(path="vendor/b.cpp", line=3, symbol="curl_easy_perform", context="call"),
+        ],
+    )
+    assert _enrich_graphify(str(tmp_path), [dep]) is True
+    assert dep.blast_radius == 1
+    assert dep.call_depth == 1
+    assert any("lower bound" in n for n in dep.notes)
+    assert any("1 of 2 located site" in n for n in dep.notes)
 
 
 def test_graphify_prefers_call_edges_over_references(tmp_path):
